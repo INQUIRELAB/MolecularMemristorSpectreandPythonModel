@@ -1,0 +1,43 @@
+def Ru_azo(data_dir=None):
+    """
+    Returns optimized parameters and PWL paths for the Ru_azo device (Clustered Multi-Sweep Fit).
+    """
+    if data_dir is None:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        data_dir = os.path.join(current_dir, "data")
+        
+    return {
+        "vSmooth": 0.002919,
+        "nSmooth": 150.97,
+        "kappa": 1.159925e+07,
+        "alpha": 7.128745,
+        "gScale": 6.357660,
+        "vTh": 0.684261,
+        "vRefPos": 0.900000,
+        "vRefNeg": 0.750000,
+        "nMax": 33040,
+        "nInit": 0.000000,
+        "kDischarge": 120.69,
+        "rC": 0.046726,
+        "E_a": 0.281065,
+        "R_th": 165.00,
+        "tau_th": 7.949e-08,
+        "gamma": -0.017936,
+        "beta_alpha": 2.642626,
+        "beta_s": -2.479418,
+        "rate_asymmetry": 1.001551,
+        "rTopBlend": 0.050000,
+        "fDischarge": 0.257364,
+        "rBottomBlend": 0.050000,
+        "rLatency": 0.882483,
+        "k_overdrive": 2.850000,
+        "safe_max_vwrite": 0.00,
+        "f22StartVal": 0.12037256,
+        "f22PeakVal": 0.87791974,
+        "f22EndVal": 0.13955489,
+        # Lookup table files
+        "iScale_file": os.path.join(data_dir, "I_scale.pwl"),
+        "vScale_file": os.path.join(data_dir, "V_scale.pwl"),
+        "f22PotMap_file": os.path.join(data_dir, "f22_pot_map.pwl"),
+        "f22DepMap_file": os.path.join(data_dir, "f22_dep_map.pwl")
+    }
