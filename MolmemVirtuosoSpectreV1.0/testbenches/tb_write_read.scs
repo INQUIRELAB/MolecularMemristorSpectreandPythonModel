@@ -1,0 +1,48 @@
+// ============================================================================
+// Molecular Memristor Write-Then-Read Non-Destructive Sensing Testbench
+// File: tb_write_read.scs
+//
+// Phase 1: High-voltage WRITE pulses (+0.9V, 80ns) to program conductance.
+// Phase 2: Low-voltage READ pulses (+0.1V, 80ns) to sense current without state perturbation.
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+
+
+// --- Parameters ---
+parameters nWrite   = 1000      // Write pulse count
+parameters tPeriod  = 160n      // Pulse period
+parameters tWrite   = 80n       // Pulse width
+parameters vWrite   = 0.9       // Write amplitude
+parameters vRead    = 0.1       // Sub-threshold read amplitude
+
+parameters tWriteEnd = nWrite * tPeriod     // 160 us
+parameters tIdle     = 50u                  // 50 us idle time
+parameters tReadEnd  = tWriteEnd + tIdle + 50*tPeriod // 50 read pulses
+parameters tStop     = tReadEnd + 10u
+
+// Write Clock (+0.9V pulses during write phase)
+VclkW (clkW 0) vsource type=pulse val0=0 val1=vWrite period=tPeriod width=tWrite rise=1n fall=1n
+
+// Read Clock (+0.1V pulses during read phase)
+VclkR (clkR 0) vsource type=pulse val0=0 val1=vRead period=tPeriod width=tWrite rise=1n fall=1n
+
+// Multi-Phase Voltage Drive
+vDrive (driveNode 0) bsource v= \
+    (time < tWriteEnd) ? V(clkW) : \
+    ((time >= tWriteEnd + tIdle) && (time < tReadEnd)) ? V(clkR) : 0.0
+
+// Diagnostic DUT
+Xdut (driveNode 0 f22 pulseState conductance junctionTemp) molmem_device_mon n_init=0.0
+
+tranWr tran stop=tStop step=10n maxstep=5n errpreset=moderate
+
+// Waveform Saves (Exact 1-to-1 Parity with Python Subfigures)
+save vDrive
+save f22
+save pulseState
+save conductance
+save junctionTemp
+save Xdut:Anode

@@ -1,0 +1,1932 @@
+// ============================================================================
+// Molecular Memristor Compact Physics Core (Verilog-A)
+// Module: molmem_core
+//
+// Complete implementation of continuous kinetic ODE and transport physics
+// from Python `molmem_lib` (device_jit.py) with exact CPU-style fastpaths.
+//
+// Fastpaths included:
+//   1. Zero/Micro-Volt Fastpath (|V| < 1e-6 V): Bypasses all transcendental math
+//   2. Sub-threshold Fastpath (|V| < vBypass): Bypasses power-law ODE for read/idle
+//   3. Saturated Boundary Fastpath (n >= n_max with V > Vth, or n <= 0 with V < -Vth)
+//   4. Zero Conductance Fastpath (f22 <= 0.0): Bypasses sinh() current transport
+//   5. Asymptotically Bounded Softplus & Tanh: Prevents floating point overflow
+// ============================================================================
+
+`include "disciplines.vams"
+`include "constants.vams"
+
+// ============================================================================
+// High-Speed Direct O(1) Linear Interpolation Macro for Uniform PWL Arrays
+// Matches Python jit_interp_O1: O(1) direct array indexing, zero while loops
+// ============================================================================
+`define PWL_O1_LOOKUP(res, x_in, y_arr, X_MAX, INV_DX, N_PTS) \
+    begin \
+        interp_x = x_in; \
+        if (interp_x <= 0.0) begin \
+            res = y_arr[0]; \
+        end else if (interp_x >= X_MAX) begin \
+            res = y_arr[N_PTS - 1]; \
+        end else begin \
+            interp_u = interp_x * INV_DX; \
+            interp_idx = interp_u; \
+            if (interp_idx < 0) interp_idx = 0; \
+            else if (interp_idx >= N_PTS - 1) interp_idx = N_PTS - 2; \
+            interp_frac = interp_u - interp_idx; \
+            res = y_arr[interp_idx] + interp_frac * (y_arr[interp_idx + 1] - y_arr[interp_idx]); \
+        end \
+    end
+
+// ============================================================================
+// High-Speed Binary-Search Piecewise-Linear Interpolation Macro
+// Bounds to [y[0], y[N-1]] outside [x[0], x[N-1]]; performs bisection search
+// ============================================================================
+`define PWL_LOOKUP(res, x_in, x_arr, y_arr, N_PTS) \
+    begin \
+        interp_x = x_in; \
+        if (interp_x <= x_arr[0]) begin \
+            res = y_arr[0]; \
+        end else if (interp_x >= x_arr[N_PTS - 1]) begin \
+            res = y_arr[N_PTS - 1]; \
+        end else begin \
+            interp_lo = 0; \
+            interp_hi = N_PTS - 1; \
+            while (interp_hi - interp_lo > 1) begin \
+                interp_mid = (interp_lo + interp_hi) / 2; \
+                if (interp_x >= x_arr[interp_mid]) begin \
+                    interp_lo = interp_mid; \
+                end else begin \
+                    interp_hi = interp_mid; \
+                end \
+            end \
+            interp_frac = (interp_x - x_arr[interp_lo]) / (x_arr[interp_hi] - x_arr[interp_lo]); \
+            res = y_arr[interp_lo] + interp_frac * (y_arr[interp_hi] - y_arr[interp_lo]); \
+        end \
+    end
+
+// ============================================================================
+// Constant Value Direct Assignment Macro for Flat PWL Tables
+// Completely avoids array search and interpolation when values are uniform
+// ============================================================================
+`define PWL_CONST_LOOKUP(res, y_arr) \
+    begin \
+        res = y_arr[0]; \
+    end
+
+module molmem_core(TE, BE, f22, pulseState, conductance, junctionTemp);
+
+    // --- External Terminals ---
+    inout TE, BE;
+    output f22, pulseState, conductance, junctionTemp;
+
+    electrical TE, BE;
+    electrical f22, pulseState, conductance, junctionTemp;
+
+    // --- Physics Parameters (Default Alignment to devices.py) ---
+    parameter real V_smooth        = 0.103776   from (0:inf);    // Voltage smoothing parameter (V)
+    parameter real n_smooth        = 17.06      from (0:inf);    // Boundary clamping smoothness
+    parameter real kappa           = 1.172865e7 from (0:inf);    // Base transition rate (states/sec)
+    parameter real alpha           = 0.931756   from (0:inf);    // Non-linear acceleration exponent
+    parameter real gScale          = 6.227303   from (0:inf);    // Conductance multiplier
+    parameter real Vth             = 0.466409   from (0:inf);    // Threshold switching voltage (V)
+    parameter real Vref_pos        = 0.900000   from (0:inf);    // Positive reference voltage (V)
+    parameter real Vref_neg        = 0.750000   from (0:inf);    // Negative reference voltage (V)
+    parameter real rate_asymmetry  = 0.985694   from (0:inf);    // Rate asymmetry ratio (RESET / SET)
+    parameter real n_max           = 33040.0    from (0:inf);    // Maximum state bound
+    parameter real n_init          = 0.0        from [0:n_max];  // Initial state condition
+    parameter real K_discharge     = 362.88     from [0:inf);    // Dynamic reset discharge speed
+    parameter real f22_start_val   = 0.12037256 from (0:1);      // f22 potentiation baseline
+    parameter real f22_peak_val    = 0.87791974 from (0:1);      // f22 peak value
+    parameter real f22_end_val     = 0.13955489 from (0:1);      // f22 depression baseline
+
+    // Stark & Thermal Parameters (from devices.py)
+    parameter real gamma           = -0.012230;                  // State-to-barrier coupling
+    parameter real beta_alpha      = 0.125186;                   // High-field alpha coefficient
+    parameter real beta_s          = -4.382853;                  // High-field n_smooth coefficient
+    parameter real E_a             = 0.155923   from [0:inf);    // Activation energy (eV)
+    parameter real R_th            = 52.14      from [0:inf);    // Thermal resistance (K/W)
+    parameter real tau_th          = 1.278e-7   from (0:inf);    // Thermal relaxation time constant (s)
+
+    // Unified Saturation & Recovery Parameters (from devices.py)
+    parameter real rTopBlend       = 0.050000;                   // Top blend ratio
+    parameter real fDischarge      = 0.374848;                   // Discharge decay power index
+    parameter real cDischarge      = 0.0;                        // Initial / override write overdrive
+    parameter real rBottomBlend    = 0.714488;                   // Bottom blend scale factor
+    parameter real rLatency        = 0.878506;                   // Latency shelf ratio
+    parameter real k_overdrive     = 7.296635;                   // Overdrive turnaround sensitivity
+
+    // Empirical Multi-Channel Noise Parameters (from PWL models)
+    parameter real noise_en                = 0.0        from [0:1];      // Master noise switch (0=Off, 1=On)
+    parameter real d2d_variation_intensity = 0.0        from [0:inf);    // D2D Mismatch intensity
+    parameter real d2d_u                   = 0.5        from [0:1];      // Uniform quantile u in [0, 1] for D2D inverse-CDF
+    parameter real read_noise_intensity    = 0.0        from [0:inf);    // Temporal read noise intensity
+    parameter real write_noise_intensity   = 0.0        from [0:inf);    // Cycle-to-cycle write noise intensity
+    parameter real write_noise_seed        = 0.0;                        // Normal(0, 1) stochastic seed for write noise
+    parameter integer mon_en               = 0          from [0:1];      // Diagnostic pin export switch (0=Off, 1=On)
+
+    // Precomputed Constants & Inverses
+    localparam real f22_pot_scale_inv     = 1.0 / (f22_peak_val - f22_start_val);
+    localparam real f22_dep_scale_inv     = 1.0 / (f22_peak_val - f22_end_val);
+    localparam real one_minus_f22_end_val = 1.0 - f22_end_val;
+    localparam real vBypass               = Vth - 3.0 * V_smooth;    // Safe sub-threshold early exit (0.155V)
+    localparam real inv_V_smooth          = 1.0 / V_smooth;
+    localparam real inv_300               = 1.0 / 300.0;
+    localparam real inv_30                = 1.0 / 30.0;
+    localparam real inv_16520             = 1.0 / 16520.0;
+    localparam real n_base_nominal        = 0.5 * n_max;
+    localparam real scale_base            = (rBottomBlend >= 0.05 && rBottomBlend <= 2.5) ? rBottomBlend : 1.0;
+    localparam real one_minus_scale_base  = 1.0 - scale_base;
+    localparam real gamma_eff             = gamma;
+    localparam real scale_top             = (rTopBlend >= 0.001 && rTopBlend <= 0.5) ? rTopBlend : 0.05;
+    localparam real r_lat                 = (rLatency >= 0.0 && rLatency < 0.999) ? rLatency : 0.5;
+    localparam real k_amp                 = (K_discharge > 0.0) ? K_discharge : 0.0;
+    localparam real p_decay               = (fDischarge >= 0.05 && fDischarge <= 0.95) ? (1.0 / fDischarge) : 2.5;
+    localparam real d_val_pos             = Vref_pos - Vth + 1e-6;
+    localparam real d_val_neg             = Vref_neg - Vth + 1e-6;
+    localparam real inv_d_val_pos         = 1.0 / ((d_val_pos > 1e-15) ? d_val_pos : 1e-15);
+    localparam real inv_d_val_neg         = 1.0 / ((d_val_neg > 1e-15) ? d_val_neg : 1e-15);
+    localparam real vs_inv_d_val_pos      = V_smooth * inv_d_val_pos;
+    localparam real vs_inv_d_val_neg      = V_smooth * inv_d_val_neg;
+    localparam real ea_arrhenius          = (E_a > 0.0) ? (E_a * 11604.51812063) : 0.0;
+    localparam real inv_tau_th            = (tau_th > 0.0) ? (1.0 / tau_th) : 0.0;
+
+    // --- Internal Real Variables ---
+    real v_int, abs_v;
+    real n_raw, mode_raw, temp_raw;
+    real n_curr, mode_curr, scale_curr, scale_latch, temp_curr, c_od_curr, c_od_latch;
+    real tanh_arg, v_tanh;
+    real softplus_arg, softplus;
+    real clamp_factor, w_bound, dist_bound, z_bound;
+    real kappa_clamp, d_val, base_rate, rate_mag, s_pol, vref_eff;
+    real dn_dt;
+    real n_base, od_ratio, overdrive, od_clamp, w_trans, u_base, s_base;
+    real n_turnaround, excursion, u_sat, u_rec, w_top, dist_from_peak, z_top, s_top;
+    real r_lat_eff, u_decay, eff_rate_factor, eff_mult;
+    real target_mode, d_mode_dt;
+    real f22_pot_raw, f22_dep_raw;
+    real f22_pot_scaled, f22_dep_scaled;
+    real denom_scale, target_scale;
+    real f22_active, i_mem, v_clip;
+    real alpha_eff, n_smooth_eff;
+    real delta_v, tanh_delta_v, p_diss, t_steady, d_temp_dt, thermal_factor, t_amb;
+    real od_inst;
+    real gScale_eff, d2d_delta;
+    real rel_sigma_read, i_floor_noise, i_scale_noise, pwr_read_noise;
+    real rel_sigma_write;
+    real g_i_scale, inv_v_scale_val;
+
+    // ========================================================================
+    // Embedded Empirical PWL Characterization Arrays (Protected IP Data)
+    // Generated automatically by SpectreModelDataEncryption/build_encryption_package.py
+    // ========================================================================
+    real y_pot[0:3400];
+    real y_dep[0:3400];
+    real x_d2d[0:102], y_d2d[0:102];
+    real x_rnoise[0:24], y_rnoise[0:24];
+    real x_wnoise[0:51], y_wnoise[0:51];
+    real y_vscale[0:0];
+    real y_iscale[0:0];
+
+    // Fast Interpolation Registers
+    integer interp_lo, interp_hi, interp_mid, interp_idx;
+    real interp_x, interp_u, interp_frac;
+
+    analog begin
+
+        // --- One-Time Simulation & Invariant Initialization ---
+        @(initial_step or initial_step("tran")) begin
+            scale_latch    = 1.0;
+            scale_curr     = 1.0;
+            c_od_latch     = cDischarge;
+        // --- Populating Embedded Empirical PWL Data Tables at t=0 ---
+        // Table: f22_pot_map.pwl (3401 points)
+        y_pot[0]=0.120662;y_pot[1]=0.121086;y_pot[2]=0.12151;y_pot[3]=0.121934;y_pot[4]=0.122358;
+        y_pot[5]=0.122783;y_pot[6]=0.123208;y_pot[7]=0.123633;y_pot[8]=0.124058;y_pot[9]=0.124483;
+        y_pot[10]=0.124909;y_pot[11]=0.125335;y_pot[12]=0.125761;y_pot[13]=0.126188;y_pot[14]=0.126615;
+        y_pot[15]=0.127042;y_pot[16]=0.127469;y_pot[17]=0.127896;y_pot[18]=0.128324;y_pot[19]=0.128752;
+        y_pot[20]=0.12918;y_pot[21]=0.129609;y_pot[22]=0.130038;y_pot[23]=0.130467;y_pot[24]=0.130896;
+        y_pot[25]=0.131326;y_pot[26]=0.131756;y_pot[27]=0.132186;y_pot[28]=0.132616;y_pot[29]=0.133047;
+        y_pot[30]=0.133478;y_pot[31]=0.13391;y_pot[32]=0.134341;y_pot[33]=0.134773;y_pot[34]=0.135205;
+        y_pot[35]=0.135638;y_pot[36]=0.13607;y_pot[37]=0.136503;y_pot[38]=0.136936;y_pot[39]=0.13737;
+        y_pot[40]=0.137804;y_pot[41]=0.138238;y_pot[42]=0.138672;y_pot[43]=0.139106;y_pot[44]=0.139541;
+        y_pot[45]=0.139976;y_pot[46]=0.140411;y_pot[47]=0.140847;y_pot[48]=0.141282;y_pot[49]=0.141718;
+        y_pot[50]=0.142154;y_pot[51]=0.14259;y_pot[52]=0.143026;y_pot[53]=0.143463;y_pot[54]=0.1439;
+        y_pot[55]=0.144336;y_pot[56]=0.144773;y_pot[57]=0.145211;y_pot[58]=0.145648;y_pot[59]=0.146085;
+        y_pot[60]=0.146523;y_pot[61]=0.146961;y_pot[62]=0.147399;y_pot[63]=0.147837;y_pot[64]=0.148275;
+        y_pot[65]=0.148713;y_pot[66]=0.149151;y_pot[67]=0.14959;y_pot[68]=0.150028;y_pot[69]=0.150467;
+        y_pot[70]=0.150906;y_pot[71]=0.151345;y_pot[72]=0.151784;y_pot[73]=0.152223;y_pot[74]=0.152662;
+        y_pot[75]=0.153102;y_pot[76]=0.153541;y_pot[77]=0.153981;y_pot[78]=0.154421;y_pot[79]=0.154861;
+        y_pot[80]=0.155301;y_pot[81]=0.155741;y_pot[82]=0.156181;y_pot[83]=0.156622;y_pot[84]=0.157063;
+        y_pot[85]=0.157503;y_pot[86]=0.157944;y_pot[87]=0.158385;y_pot[88]=0.158827;y_pot[89]=0.159268;
+        y_pot[90]=0.15971;y_pot[91]=0.160152;y_pot[92]=0.160594;y_pot[93]=0.161036;y_pot[94]=0.161478;
+        y_pot[95]=0.161921;y_pot[96]=0.162364;y_pot[97]=0.162806;y_pot[98]=0.16325;y_pot[99]=0.163693;
+        y_pot[100]=0.164136;y_pot[101]=0.16458;y_pot[102]=0.165024;y_pot[103]=0.165468;y_pot[104]=0.165912;
+        y_pot[105]=0.166357;y_pot[106]=0.166801;y_pot[107]=0.167246;y_pot[108]=0.167691;y_pot[109]=0.168136;
+        y_pot[110]=0.168582;y_pot[111]=0.169027;y_pot[112]=0.169473;y_pot[113]=0.169918;y_pot[114]=0.170364;
+        y_pot[115]=0.17081;y_pot[116]=0.171256;y_pot[117]=0.171703;y_pot[118]=0.172149;y_pot[119]=0.172596;
+        y_pot[120]=0.173042;y_pot[121]=0.173489;y_pot[122]=0.173936;y_pot[123]=0.174383;y_pot[124]=0.17483;
+        y_pot[125]=0.175277;y_pot[126]=0.175724;y_pot[127]=0.176171;y_pot[128]=0.176619;y_pot[129]=0.177066;
+        y_pot[130]=0.177514;y_pot[131]=0.177961;y_pot[132]=0.178409;y_pot[133]=0.178856;y_pot[134]=0.179304;
+        y_pot[135]=0.179752;y_pot[136]=0.1802;y_pot[137]=0.180647;y_pot[138]=0.181095;y_pot[139]=0.181543;
+        y_pot[140]=0.181991;y_pot[141]=0.182439;y_pot[142]=0.182888;y_pot[143]=0.183336;y_pot[144]=0.183784;
+        y_pot[145]=0.184232;y_pot[146]=0.184681;y_pot[147]=0.185129;y_pot[148]=0.185578;y_pot[149]=0.186027;
+        y_pot[150]=0.186475;y_pot[151]=0.186924;y_pot[152]=0.187373;y_pot[153]=0.187822;y_pot[154]=0.188272;
+        y_pot[155]=0.188721;y_pot[156]=0.18917;y_pot[157]=0.18962;y_pot[158]=0.190069;y_pot[159]=0.190519;
+        y_pot[160]=0.190969;y_pot[161]=0.191419;y_pot[162]=0.191869;y_pot[163]=0.19232;y_pot[164]=0.19277;
+        y_pot[165]=0.193221;y_pot[166]=0.193672;y_pot[167]=0.194123;y_pot[168]=0.194574;y_pot[169]=0.195025;
+        y_pot[170]=0.195476;y_pot[171]=0.195928;y_pot[172]=0.196379;y_pot[173]=0.196831;y_pot[174]=0.197283;
+        y_pot[175]=0.197735;y_pot[176]=0.198187;y_pot[177]=0.198639;y_pot[178]=0.199092;y_pot[179]=0.199544;
+        y_pot[180]=0.199997;y_pot[181]=0.20045;y_pot[182]=0.200902;y_pot[183]=0.201355;y_pot[184]=0.201808;
+        y_pot[185]=0.202261;y_pot[186]=0.202715;y_pot[187]=0.203168;y_pot[188]=0.203621;y_pot[189]=0.204074;
+        y_pot[190]=0.204528;y_pot[191]=0.204981;y_pot[192]=0.205435;y_pot[193]=0.205888;y_pot[194]=0.206342;
+        y_pot[195]=0.206796;y_pot[196]=0.207249;y_pot[197]=0.207703;y_pot[198]=0.208157;y_pot[199]=0.208611;
+        y_pot[200]=0.209064;y_pot[201]=0.209518;y_pot[202]=0.209972;y_pot[203]=0.210426;y_pot[204]=0.21088;
+        y_pot[205]=0.211334;y_pot[206]=0.211788;y_pot[207]=0.212241;y_pot[208]=0.212695;y_pot[209]=0.213149;
+        y_pot[210]=0.213603;y_pot[211]=0.214057;y_pot[212]=0.214512;y_pot[213]=0.214966;y_pot[214]=0.21542;
+        y_pot[215]=0.215874;y_pot[216]=0.216328;y_pot[217]=0.216783;y_pot[218]=0.217237;y_pot[219]=0.217692;
+        y_pot[220]=0.218146;y_pot[221]=0.218601;y_pot[222]=0.219055;y_pot[223]=0.21951;y_pot[224]=0.219965;
+        y_pot[225]=0.22042;y_pot[226]=0.220875;y_pot[227]=0.22133;y_pot[228]=0.221786;y_pot[229]=0.222241;
+        y_pot[230]=0.222696;y_pot[231]=0.223152;y_pot[232]=0.223608;y_pot[233]=0.224064;y_pot[234]=0.22452;
+        y_pot[235]=0.224976;y_pot[236]=0.225432;y_pot[237]=0.225888;y_pot[238]=0.226345;y_pot[239]=0.226801;
+        y_pot[240]=0.227258;y_pot[241]=0.227714;y_pot[242]=0.228171;y_pot[243]=0.228628;y_pot[244]=0.229085;
+        y_pot[245]=0.229542;y_pot[246]=0.23;y_pot[247]=0.230457;y_pot[248]=0.230914;y_pot[249]=0.231372;
+        y_pot[250]=0.23183;y_pot[251]=0.232287;y_pot[252]=0.232745;y_pot[253]=0.233203;y_pot[254]=0.23366;
+        y_pot[255]=0.234118;y_pot[256]=0.234576;y_pot[257]=0.235034;y_pot[258]=0.235492;y_pot[259]=0.23595;
+        y_pot[260]=0.236408;y_pot[261]=0.236866;y_pot[262]=0.237324;y_pot[263]=0.237782;y_pot[264]=0.23824;
+        y_pot[265]=0.238698;y_pot[266]=0.239157;y_pot[267]=0.239615;y_pot[268]=0.240073;y_pot[269]=0.240531;
+        y_pot[270]=0.240989;y_pot[271]=0.241447;y_pot[272]=0.241905;y_pot[273]=0.242363;y_pot[274]=0.242821;
+        y_pot[275]=0.243279;y_pot[276]=0.243737;y_pot[277]=0.244195;y_pot[278]=0.244654;y_pot[279]=0.245112;
+        y_pot[280]=0.24557;y_pot[281]=0.246028;y_pot[282]=0.246486;y_pot[283]=0.246945;y_pot[284]=0.247403;
+        y_pot[285]=0.247861;y_pot[286]=0.248319;y_pot[287]=0.248778;y_pot[288]=0.249236;y_pot[289]=0.249695;
+        y_pot[290]=0.250153;y_pot[291]=0.250612;y_pot[292]=0.251071;y_pot[293]=0.25153;y_pot[294]=0.251988;
+        y_pot[295]=0.252447;y_pot[296]=0.252907;y_pot[297]=0.253366;y_pot[298]=0.253825;y_pot[299]=0.254284;
+        y_pot[300]=0.254744;y_pot[301]=0.255203;y_pot[302]=0.255663;y_pot[303]=0.256123;y_pot[304]=0.256582;
+        y_pot[305]=0.257042;y_pot[306]=0.257502;y_pot[307]=0.257962;y_pot[308]=0.258423;y_pot[309]=0.258883;
+        y_pot[310]=0.259343;y_pot[311]=0.259804;y_pot[312]=0.260264;y_pot[313]=0.260725;y_pot[314]=0.261186;
+        y_pot[315]=0.261647;y_pot[316]=0.262107;y_pot[317]=0.262568;y_pot[318]=0.263029;y_pot[319]=0.26349;
+        y_pot[320]=0.263951;y_pot[321]=0.264413;y_pot[322]=0.264874;y_pot[323]=0.265335;y_pot[324]=0.265796;
+        y_pot[325]=0.266257;y_pot[326]=0.266718;y_pot[327]=0.26718;y_pot[328]=0.267641;y_pot[329]=0.268102;
+        y_pot[330]=0.268563;y_pot[331]=0.269025;y_pot[332]=0.269486;y_pot[333]=0.269947;y_pot[334]=0.270408;
+        y_pot[335]=0.27087;y_pot[336]=0.271331;y_pot[337]=0.271792;y_pot[338]=0.272253;y_pot[339]=0.272714;
+        y_pot[340]=0.273175;y_pot[341]=0.273636;y_pot[342]=0.274098;y_pot[343]=0.274559;y_pot[344]=0.27502;
+        y_pot[345]=0.275481;y_pot[346]=0.275942;y_pot[347]=0.276403;y_pot[348]=0.276864;y_pot[349]=0.277325;
+        y_pot[350]=0.277786;y_pot[351]=0.278248;y_pot[352]=0.278709;y_pot[353]=0.27917;y_pot[354]=0.279631;
+        y_pot[355]=0.280092;y_pot[356]=0.280554;y_pot[357]=0.281015;y_pot[358]=0.281476;y_pot[359]=0.281938;
+        y_pot[360]=0.2824;y_pot[361]=0.282861;y_pot[362]=0.283323;y_pot[363]=0.283785;y_pot[364]=0.284246;
+        y_pot[365]=0.284708;y_pot[366]=0.28517;y_pot[367]=0.285632;y_pot[368]=0.286095;y_pot[369]=0.286557;
+        y_pot[370]=0.287019;y_pot[371]=0.287482;y_pot[372]=0.287944;y_pot[373]=0.288407;y_pot[374]=0.288869;
+        y_pot[375]=0.289332;y_pot[376]=0.289795;y_pot[377]=0.290258;y_pot[378]=0.290721;y_pot[379]=0.291184;
+        y_pot[380]=0.291647;y_pot[381]=0.29211;y_pot[382]=0.292574;y_pot[383]=0.293037;y_pot[384]=0.2935;
+        y_pot[385]=0.293964;y_pot[386]=0.294427;y_pot[387]=0.294891;y_pot[388]=0.295354;y_pot[389]=0.295818;
+        y_pot[390]=0.296281;y_pot[391]=0.296745;y_pot[392]=0.297209;y_pot[393]=0.297672;y_pot[394]=0.298136;
+        y_pot[395]=0.298599;y_pot[396]=0.299063;y_pot[397]=0.299527;y_pot[398]=0.29999;y_pot[399]=0.300454;
+        y_pot[400]=0.300917;y_pot[401]=0.301381;y_pot[402]=0.301844;y_pot[403]=0.302308;y_pot[404]=0.302771;
+        y_pot[405]=0.303235;y_pot[406]=0.303698;y_pot[407]=0.304162;y_pot[408]=0.304625;y_pot[409]=0.305088;
+        y_pot[410]=0.305552;y_pot[411]=0.306015;y_pot[412]=0.306478;y_pot[413]=0.306942;y_pot[414]=0.307405;
+        y_pot[415]=0.307868;y_pot[416]=0.308331;y_pot[417]=0.308795;y_pot[418]=0.309258;y_pot[419]=0.309721;
+        y_pot[420]=0.310185;y_pot[421]=0.310648;y_pot[422]=0.311111;y_pot[423]=0.311575;y_pot[424]=0.312038;
+        y_pot[425]=0.312502;y_pot[426]=0.312965;y_pot[427]=0.313429;y_pot[428]=0.313892;y_pot[429]=0.314356;
+        y_pot[430]=0.31482;y_pot[431]=0.315284;y_pot[432]=0.315748;y_pot[433]=0.316211;y_pot[434]=0.316676;
+        y_pot[435]=0.31714;y_pot[436]=0.317604;y_pot[437]=0.318068;y_pot[438]=0.318532;y_pot[439]=0.318997;
+        y_pot[440]=0.319461;y_pot[441]=0.319926;y_pot[442]=0.320391;y_pot[443]=0.320855;y_pot[444]=0.32132;
+        y_pot[445]=0.321785;y_pot[446]=0.32225;y_pot[447]=0.322715;y_pot[448]=0.32318;y_pot[449]=0.323645;
+        y_pot[450]=0.32411;y_pot[451]=0.324576;y_pot[452]=0.325041;y_pot[453]=0.325506;y_pot[454]=0.325971;
+        y_pot[455]=0.326437;y_pot[456]=0.326902;y_pot[457]=0.327368;y_pot[458]=0.327833;y_pot[459]=0.328298;
+        y_pot[460]=0.328764;y_pot[461]=0.329229;y_pot[462]=0.329695;y_pot[463]=0.33016;y_pot[464]=0.330625;
+        y_pot[465]=0.331091;y_pot[466]=0.331556;y_pot[467]=0.332021;y_pot[468]=0.332487;y_pot[469]=0.332952;
+        y_pot[470]=0.333417;y_pot[471]=0.333882;y_pot[472]=0.334348;y_pot[473]=0.334813;y_pot[474]=0.335278;
+        y_pot[475]=0.335743;y_pot[476]=0.336208;y_pot[477]=0.336673;y_pot[478]=0.337138;y_pot[479]=0.337603;
+        y_pot[480]=0.338068;y_pot[481]=0.338533;y_pot[482]=0.338998;y_pot[483]=0.339463;y_pot[484]=0.339927;
+        y_pot[485]=0.340392;y_pot[486]=0.340857;y_pot[487]=0.341322;y_pot[488]=0.341787;y_pot[489]=0.342252;
+        y_pot[490]=0.342717;y_pot[491]=0.343182;y_pot[492]=0.343647;y_pot[493]=0.344112;y_pot[494]=0.344577;
+        y_pot[495]=0.345042;y_pot[496]=0.345508;y_pot[497]=0.345973;y_pot[498]=0.346438;y_pot[499]=0.346903;
+        y_pot[500]=0.347369;y_pot[501]=0.347834;y_pot[502]=0.3483;y_pot[503]=0.348766;y_pot[504]=0.349231;
+        y_pot[505]=0.349697;y_pot[506]=0.350163;y_pot[507]=0.350629;y_pot[508]=0.351095;y_pot[509]=0.351561;
+        y_pot[510]=0.352027;y_pot[511]=0.352493;y_pot[512]=0.35296;y_pot[513]=0.353426;y_pot[514]=0.353892;
+        y_pot[515]=0.354359;y_pot[516]=0.354825;y_pot[517]=0.355292;y_pot[518]=0.355758;y_pot[519]=0.356225;
+        y_pot[520]=0.356692;y_pot[521]=0.357158;y_pot[522]=0.357625;y_pot[523]=0.358092;y_pot[524]=0.358559;
+        y_pot[525]=0.359025;y_pot[526]=0.359492;y_pot[527]=0.359959;y_pot[528]=0.360426;y_pot[529]=0.360892;
+        y_pot[530]=0.361359;y_pot[531]=0.361826;y_pot[532]=0.362293;y_pot[533]=0.362759;y_pot[534]=0.363226;
+        y_pot[535]=0.363692;y_pot[536]=0.364159;y_pot[537]=0.364626;y_pot[538]=0.365092;y_pot[539]=0.365558;
+        y_pot[540]=0.366025;y_pot[541]=0.366491;y_pot[542]=0.366958;y_pot[543]=0.367424;y_pot[544]=0.36789;
+        y_pot[545]=0.368356;y_pot[546]=0.368823;y_pot[547]=0.369289;y_pot[548]=0.369755;y_pot[549]=0.370221;
+        y_pot[550]=0.370687;y_pot[551]=0.371153;y_pot[552]=0.371619;y_pot[553]=0.372086;y_pot[554]=0.372552;
+        y_pot[555]=0.373018;y_pot[556]=0.373484;y_pot[557]=0.37395;y_pot[558]=0.374416;y_pot[559]=0.374882;
+        y_pot[560]=0.375349;y_pot[561]=0.375815;y_pot[562]=0.376281;y_pot[563]=0.376747;y_pot[564]=0.377214;
+        y_pot[565]=0.37768;y_pot[566]=0.378147;y_pot[567]=0.378613;y_pot[568]=0.37908;y_pot[569]=0.379546;
+        y_pot[570]=0.380013;y_pot[571]=0.38048;y_pot[572]=0.380947;y_pot[573]=0.381414;y_pot[574]=0.38188;
+        y_pot[575]=0.382348;y_pot[576]=0.382815;y_pot[577]=0.383282;y_pot[578]=0.383749;y_pot[579]=0.384216;
+        y_pot[580]=0.384684;y_pot[581]=0.385151;y_pot[582]=0.385619;y_pot[583]=0.386086;y_pot[584]=0.386554;
+        y_pot[585]=0.387021;y_pot[586]=0.387489;y_pot[587]=0.387957;y_pot[588]=0.388424;y_pot[589]=0.388892;
+        y_pot[590]=0.38936;y_pot[591]=0.389827;y_pot[592]=0.390295;y_pot[593]=0.390763;y_pot[594]=0.391231;
+        y_pot[595]=0.391698;y_pot[596]=0.392166;y_pot[597]=0.392634;y_pot[598]=0.393102;y_pot[599]=0.393569;
+        y_pot[600]=0.394037;y_pot[601]=0.394504;y_pot[602]=0.394972;y_pot[603]=0.39544;y_pot[604]=0.395907;
+        y_pot[605]=0.396375;y_pot[606]=0.396842;y_pot[607]=0.397309;y_pot[608]=0.397777;y_pot[609]=0.398244;
+        y_pot[610]=0.398711;y_pot[611]=0.399178;y_pot[612]=0.399646;y_pot[613]=0.400113;y_pot[614]=0.40058;
+        y_pot[615]=0.401047;y_pot[616]=0.401514;y_pot[617]=0.401981;y_pot[618]=0.402448;y_pot[619]=0.402915;
+        y_pot[620]=0.403382;y_pot[621]=0.403849;y_pot[622]=0.404316;y_pot[623]=0.404783;y_pot[624]=0.40525;
+        y_pot[625]=0.405717;y_pot[626]=0.406184;y_pot[627]=0.406651;y_pot[628]=0.407118;y_pot[629]=0.407585;
+        y_pot[630]=0.408052;y_pot[631]=0.408519;y_pot[632]=0.408986;y_pot[633]=0.409453;y_pot[634]=0.409921;
+        y_pot[635]=0.410388;y_pot[636]=0.410856;y_pot[637]=0.411323;y_pot[638]=0.41179;y_pot[639]=0.412258;
+        y_pot[640]=0.412726;y_pot[641]=0.413193;y_pot[642]=0.413661;y_pot[643]=0.414129;y_pot[644]=0.414597;
+        y_pot[645]=0.415065;y_pot[646]=0.415533;y_pot[647]=0.416001;y_pot[648]=0.416469;y_pot[649]=0.416937;
+        y_pot[650]=0.417406;y_pot[651]=0.417874;y_pot[652]=0.418342;y_pot[653]=0.41881;y_pot[654]=0.419279;
+        y_pot[655]=0.419747;y_pot[656]=0.420216;y_pot[657]=0.420684;y_pot[658]=0.421153;y_pot[659]=0.421621;
+        y_pot[660]=0.422089;y_pot[661]=0.422558;y_pot[662]=0.423026;y_pot[663]=0.423495;y_pot[664]=0.423963;
+        y_pot[665]=0.424432;y_pot[666]=0.4249;y_pot[667]=0.425368;y_pot[668]=0.425837;y_pot[669]=0.426305;
+        y_pot[670]=0.426773;y_pot[671]=0.427241;y_pot[672]=0.427709;y_pot[673]=0.428177;y_pot[674]=0.428645;
+        y_pot[675]=0.429113;y_pot[676]=0.429581;y_pot[677]=0.430049;y_pot[678]=0.430517;y_pot[679]=0.430985;
+        y_pot[680]=0.431453;y_pot[681]=0.43192;y_pot[682]=0.432388;y_pot[683]=0.432856;y_pot[684]=0.433323;
+        y_pot[685]=0.433791;y_pot[686]=0.434259;y_pot[687]=0.434726;y_pot[688]=0.435194;y_pot[689]=0.435661;
+        y_pot[690]=0.436129;y_pot[691]=0.436596;y_pot[692]=0.437064;y_pot[693]=0.437531;y_pot[694]=0.437999;
+        y_pot[695]=0.438467;y_pot[696]=0.438934;y_pot[697]=0.439402;y_pot[698]=0.43987;y_pot[699]=0.440337;
+        y_pot[700]=0.440805;y_pot[701]=0.441273;y_pot[702]=0.441741;y_pot[703]=0.442209;y_pot[704]=0.442677;
+        y_pot[705]=0.443145;y_pot[706]=0.443613;y_pot[707]=0.444081;y_pot[708]=0.444549;y_pot[709]=0.445017;
+        y_pot[710]=0.445485;y_pot[711]=0.445954;y_pot[712]=0.446422;y_pot[713]=0.446891;y_pot[714]=0.447359;
+        y_pot[715]=0.447828;y_pot[716]=0.448297;y_pot[717]=0.448765;y_pot[718]=0.449234;y_pot[719]=0.449703;
+        y_pot[720]=0.450171;y_pot[721]=0.45064;y_pot[722]=0.451109;y_pot[723]=0.451578;y_pot[724]=0.452047;
+        y_pot[725]=0.452516;y_pot[726]=0.452985;y_pot[727]=0.453454;y_pot[728]=0.453922;y_pot[729]=0.454391;
+        y_pot[730]=0.45486;y_pot[731]=0.455329;y_pot[732]=0.455798;y_pot[733]=0.456267;y_pot[734]=0.456735;
+        y_pot[735]=0.457204;y_pot[736]=0.457673;y_pot[737]=0.458142;y_pot[738]=0.45861;y_pot[739]=0.459079;
+        y_pot[740]=0.459547;y_pot[741]=0.460016;y_pot[742]=0.460484;y_pot[743]=0.460952;y_pot[744]=0.461421;
+        y_pot[745]=0.461889;y_pot[746]=0.462357;y_pot[747]=0.462825;y_pot[748]=0.463294;y_pot[749]=0.463762;
+        y_pot[750]=0.46423;y_pot[751]=0.464698;y_pot[752]=0.465166;y_pot[753]=0.465634;y_pot[754]=0.466101;
+        y_pot[755]=0.466569;y_pot[756]=0.467037;y_pot[757]=0.467505;y_pot[758]=0.467973;y_pot[759]=0.468441;
+        y_pot[760]=0.468909;y_pot[761]=0.469377;y_pot[762]=0.469845;y_pot[763]=0.470313;y_pot[764]=0.47078;
+        y_pot[765]=0.471248;y_pot[766]=0.471716;y_pot[767]=0.472184;y_pot[768]=0.472653;y_pot[769]=0.473121;
+        y_pot[770]=0.473589;y_pot[771]=0.474057;y_pot[772]=0.474525;y_pot[773]=0.474994;y_pot[774]=0.475462;
+        y_pot[775]=0.47593;y_pot[776]=0.476399;y_pot[777]=0.476868;y_pot[778]=0.477336;y_pot[779]=0.477805;
+        y_pot[780]=0.478273;y_pot[781]=0.478742;y_pot[782]=0.479211;y_pot[783]=0.47968;y_pot[784]=0.480149;
+        y_pot[785]=0.480618;y_pot[786]=0.481087;y_pot[787]=0.481556;y_pot[788]=0.482025;y_pot[789]=0.482494;
+        y_pot[790]=0.482963;y_pot[791]=0.483432;y_pot[792]=0.483901;y_pot[793]=0.48437;y_pot[794]=0.484839;
+        y_pot[795]=0.485309;y_pot[796]=0.485778;y_pot[797]=0.486247;y_pot[798]=0.486716;y_pot[799]=0.487185;
+        y_pot[800]=0.487654;y_pot[801]=0.488123;y_pot[802]=0.488592;y_pot[803]=0.489061;y_pot[804]=0.489529;
+        y_pot[805]=0.489998;y_pot[806]=0.490467;y_pot[807]=0.490936;y_pot[808]=0.491404;y_pot[809]=0.491873;
+        y_pot[810]=0.492342;y_pot[811]=0.49281;y_pot[812]=0.493279;y_pot[813]=0.493747;y_pot[814]=0.494215;
+        y_pot[815]=0.494684;y_pot[816]=0.495152;y_pot[817]=0.49562;y_pot[818]=0.496088;y_pot[819]=0.496556;
+        y_pot[820]=0.497024;y_pot[821]=0.497492;y_pot[822]=0.497961;y_pot[823]=0.498429;y_pot[824]=0.498897;
+        y_pot[825]=0.499365;y_pot[826]=0.499833;y_pot[827]=0.500301;y_pot[828]=0.500769;y_pot[829]=0.501237;
+        y_pot[830]=0.501705;y_pot[831]=0.502173;y_pot[832]=0.502641;y_pot[833]=0.503109;y_pot[834]=0.503577;
+        y_pot[835]=0.504045;y_pot[836]=0.504513;y_pot[837]=0.504981;y_pot[838]=0.50545;y_pot[839]=0.505918;
+        y_pot[840]=0.506386;y_pot[841]=0.506855;y_pot[842]=0.507323;y_pot[843]=0.507792;y_pot[844]=0.50826;
+        y_pot[845]=0.508729;y_pot[846]=0.509197;y_pot[847]=0.509666;y_pot[848]=0.510135;y_pot[849]=0.510604;
+        y_pot[850]=0.511073;y_pot[851]=0.511542;y_pot[852]=0.512011;y_pot[853]=0.51248;y_pot[854]=0.512949;
+        y_pot[855]=0.513418;y_pot[856]=0.513887;y_pot[857]=0.514356;y_pot[858]=0.514825;y_pot[859]=0.515294;
+        y_pot[860]=0.515763;y_pot[861]=0.516232;y_pot[862]=0.516701;y_pot[863]=0.51717;y_pot[864]=0.517639;
+        y_pot[865]=0.518109;y_pot[866]=0.518578;y_pot[867]=0.519047;y_pot[868]=0.519516;y_pot[869]=0.519984;
+        y_pot[870]=0.520453;y_pot[871]=0.520922;y_pot[872]=0.521391;y_pot[873]=0.52186;y_pot[874]=0.522328;
+        y_pot[875]=0.522797;y_pot[876]=0.523266;y_pot[877]=0.523734;y_pot[878]=0.524203;y_pot[879]=0.524671;
+        y_pot[880]=0.52514;y_pot[881]=0.525608;y_pot[882]=0.526076;y_pot[883]=0.526544;y_pot[884]=0.527012;
+        y_pot[885]=0.527481;y_pot[886]=0.527949;y_pot[887]=0.528417;y_pot[888]=0.528885;y_pot[889]=0.529353;
+        y_pot[890]=0.529821;y_pot[891]=0.530288;y_pot[892]=0.530756;y_pot[893]=0.531224;y_pot[894]=0.531692;
+        y_pot[895]=0.53216;y_pot[896]=0.532628;y_pot[897]=0.533096;y_pot[898]=0.533564;y_pot[899]=0.534032;
+        y_pot[900]=0.534499;y_pot[901]=0.534967;y_pot[902]=0.535435;y_pot[903]=0.535903;y_pot[904]=0.536371;
+        y_pot[905]=0.53684;y_pot[906]=0.537308;y_pot[907]=0.537776;y_pot[908]=0.538244;y_pot[909]=0.538712;
+        y_pot[910]=0.539181;y_pot[911]=0.539649;y_pot[912]=0.540118;y_pot[913]=0.540586;y_pot[914]=0.541055;
+        y_pot[915]=0.541523;y_pot[916]=0.541992;y_pot[917]=0.54246;y_pot[918]=0.542929;y_pot[919]=0.543398;
+        y_pot[920]=0.543867;y_pot[921]=0.544335;y_pot[922]=0.544804;y_pot[923]=0.545273;y_pot[924]=0.545742;
+        y_pot[925]=0.546211;y_pot[926]=0.54668;y_pot[927]=0.547149;y_pot[928]=0.547618;y_pot[929]=0.548086;
+        y_pot[930]=0.548555;y_pot[931]=0.549024;y_pot[932]=0.549493;y_pot[933]=0.549962;y_pot[934]=0.550431;
+        y_pot[935]=0.550899;y_pot[936]=0.551368;y_pot[937]=0.551837;y_pot[938]=0.552305;y_pot[939]=0.552774;
+        y_pot[940]=0.553242;y_pot[941]=0.553711;y_pot[942]=0.554179;y_pot[943]=0.554648;y_pot[944]=0.555116;
+        y_pot[945]=0.555584;y_pot[946]=0.556052;y_pot[947]=0.55652;y_pot[948]=0.556989;y_pot[949]=0.557457;
+        y_pot[950]=0.557924;y_pot[951]=0.558392;y_pot[952]=0.55886;y_pot[953]=0.559328;y_pot[954]=0.559796;
+        y_pot[955]=0.560263;y_pot[956]=0.560731;y_pot[957]=0.561199;y_pot[958]=0.561666;y_pot[959]=0.562134;
+        y_pot[960]=0.562602;y_pot[961]=0.563069;y_pot[962]=0.563537;y_pot[963]=0.564004;y_pot[964]=0.564472;
+        y_pot[965]=0.564939;y_pot[966]=0.565407;y_pot[967]=0.565874;y_pot[968]=0.566342;y_pot[969]=0.56681;
+        y_pot[970]=0.567277;y_pot[971]=0.567745;y_pot[972]=0.568213;y_pot[973]=0.56868;y_pot[974]=0.569148;
+        y_pot[975]=0.569616;y_pot[976]=0.570084;y_pot[977]=0.570552;y_pot[978]=0.57102;y_pot[979]=0.571488;
+        y_pot[980]=0.571956;y_pot[981]=0.572424;y_pot[982]=0.572892;y_pot[983]=0.57336;y_pot[984]=0.573828;
+        y_pot[985]=0.574297;y_pot[986]=0.574765;y_pot[987]=0.575233;y_pot[988]=0.575702;y_pot[989]=0.57617;
+        y_pot[990]=0.576638;y_pot[991]=0.577107;y_pot[992]=0.577575;y_pot[993]=0.578044;y_pot[994]=0.578512;
+        y_pot[995]=0.578981;y_pot[996]=0.579449;y_pot[997]=0.579918;y_pot[998]=0.580386;y_pot[999]=0.580854;
+        y_pot[1000]=0.581323;y_pot[1001]=0.581791;y_pot[1002]=0.582259;y_pot[1003]=0.582728;y_pot[1004]=0.583196;
+        y_pot[1005]=0.583664;y_pot[1006]=0.584132;y_pot[1007]=0.5846;y_pot[1008]=0.585068;y_pot[1009]=0.585536;
+        y_pot[1010]=0.586004;y_pot[1011]=0.586472;y_pot[1012]=0.58694;y_pot[1013]=0.587407;y_pot[1014]=0.587875;
+        y_pot[1015]=0.588342;y_pot[1016]=0.58881;y_pot[1017]=0.589277;y_pot[1018]=0.589745;y_pot[1019]=0.590212;
+        y_pot[1020]=0.590679;y_pot[1021]=0.591147;y_pot[1022]=0.591614;y_pot[1023]=0.592081;y_pot[1024]=0.592548;
+        y_pot[1025]=0.593015;y_pot[1026]=0.593482;y_pot[1027]=0.593949;y_pot[1028]=0.594416;y_pot[1029]=0.594883;
+        y_pot[1030]=0.59535;y_pot[1031]=0.595817;y_pot[1032]=0.596284;y_pot[1033]=0.596751;y_pot[1034]=0.597218;
+        y_pot[1035]=0.597685;y_pot[1036]=0.598152;y_pot[1037]=0.598619;y_pot[1038]=0.599086;y_pot[1039]=0.599553;
+        y_pot[1040]=0.60002;y_pot[1041]=0.600487;y_pot[1042]=0.600954;y_pot[1043]=0.601422;y_pot[1044]=0.601889;
+        y_pot[1045]=0.602356;y_pot[1046]=0.602824;y_pot[1047]=0.603291;y_pot[1048]=0.603758;y_pot[1049]=0.604226;
+        y_pot[1050]=0.604693;y_pot[1051]=0.605161;y_pot[1052]=0.605628;y_pot[1053]=0.606096;y_pot[1054]=0.606564;
+        y_pot[1055]=0.607031;y_pot[1056]=0.607499;y_pot[1057]=0.607967;y_pot[1058]=0.608435;y_pot[1059]=0.608902;
+        y_pot[1060]=0.60937;y_pot[1061]=0.609838;y_pot[1062]=0.610306;y_pot[1063]=0.610773;y_pot[1064]=0.611241;
+        y_pot[1065]=0.611709;y_pot[1066]=0.612176;y_pot[1067]=0.612644;y_pot[1068]=0.613112;y_pot[1069]=0.613579;
+        y_pot[1070]=0.614047;y_pot[1071]=0.614514;y_pot[1072]=0.614982;y_pot[1073]=0.615449;y_pot[1074]=0.615917;
+        y_pot[1075]=0.616384;y_pot[1076]=0.616851;y_pot[1077]=0.617318;y_pot[1078]=0.617785;y_pot[1079]=0.618252;
+        y_pot[1080]=0.618719;y_pot[1081]=0.619186;y_pot[1082]=0.619653;y_pot[1083]=0.62012;y_pot[1084]=0.620586;
+        y_pot[1085]=0.621053;y_pot[1086]=0.62152;y_pot[1087]=0.621986;y_pot[1088]=0.622453;y_pot[1089]=0.622919;
+        y_pot[1090]=0.623385;y_pot[1091]=0.623852;y_pot[1092]=0.624318;y_pot[1093]=0.624784;y_pot[1094]=0.62525;
+        y_pot[1095]=0.625716;y_pot[1096]=0.626183;y_pot[1097]=0.626649;y_pot[1098]=0.627115;y_pot[1099]=0.627581;
+        y_pot[1100]=0.628047;y_pot[1101]=0.628513;y_pot[1102]=0.628979;y_pot[1103]=0.629445;y_pot[1104]=0.629911;
+        y_pot[1105]=0.630378;y_pot[1106]=0.630844;y_pot[1107]=0.63131;y_pot[1108]=0.631776;y_pot[1109]=0.632242;
+        y_pot[1110]=0.632709;y_pot[1111]=0.633175;y_pot[1112]=0.633641;y_pot[1113]=0.634108;y_pot[1114]=0.634574;
+        y_pot[1115]=0.635041;y_pot[1116]=0.635507;y_pot[1117]=0.635974;y_pot[1118]=0.63644;y_pot[1119]=0.636907;
+        y_pot[1120]=0.637374;y_pot[1121]=0.63784;y_pot[1122]=0.638307;y_pot[1123]=0.638774;y_pot[1124]=0.63924;
+        y_pot[1125]=0.639707;y_pot[1126]=0.640174;y_pot[1127]=0.640641;y_pot[1128]=0.641107;y_pot[1129]=0.641574;
+        y_pot[1130]=0.642041;y_pot[1131]=0.642508;y_pot[1132]=0.642974;y_pot[1133]=0.643441;y_pot[1134]=0.643908;
+        y_pot[1135]=0.644374;y_pot[1136]=0.644841;y_pot[1137]=0.645307;y_pot[1138]=0.645774;y_pot[1139]=0.64624;
+        y_pot[1140]=0.646707;y_pot[1141]=0.647173;y_pot[1142]=0.647639;y_pot[1143]=0.648105;y_pot[1144]=0.648572;
+        y_pot[1145]=0.649038;y_pot[1146]=0.649504;y_pot[1147]=0.64997;y_pot[1148]=0.650435;y_pot[1149]=0.650901;
+        y_pot[1150]=0.651367;y_pot[1151]=0.651832;y_pot[1152]=0.652298;y_pot[1153]=0.652763;y_pot[1154]=0.653229;
+        y_pot[1155]=0.653694;y_pot[1156]=0.654159;y_pot[1157]=0.654625;y_pot[1158]=0.65509;y_pot[1159]=0.655555;
+        y_pot[1160]=0.65602;y_pot[1161]=0.656485;y_pot[1162]=0.65695;y_pot[1163]=0.657415;y_pot[1164]=0.65788;
+        y_pot[1165]=0.658345;y_pot[1166]=0.65881;y_pot[1167]=0.659275;y_pot[1168]=0.65974;y_pot[1169]=0.660205;
+        y_pot[1170]=0.66067;y_pot[1171]=0.661134;y_pot[1172]=0.661599;y_pot[1173]=0.662064;y_pot[1174]=0.662529;
+        y_pot[1175]=0.662994;y_pot[1176]=0.663459;y_pot[1177]=0.663924;y_pot[1178]=0.664389;y_pot[1179]=0.664854;
+        y_pot[1180]=0.66532;y_pot[1181]=0.665785;y_pot[1182]=0.66625;y_pot[1183]=0.666715;y_pot[1184]=0.66718;
+        y_pot[1185]=0.667646;y_pot[1186]=0.668111;y_pot[1187]=0.668576;y_pot[1188]=0.669042;y_pot[1189]=0.669507;
+        y_pot[1190]=0.669972;y_pot[1191]=0.670438;y_pot[1192]=0.670903;y_pot[1193]=0.671368;y_pot[1194]=0.671834;
+        y_pot[1195]=0.672299;y_pot[1196]=0.672765;y_pot[1197]=0.67323;y_pot[1198]=0.673695;y_pot[1199]=0.674161;
+        y_pot[1200]=0.674626;y_pot[1201]=0.675091;y_pot[1202]=0.675557;y_pot[1203]=0.676022;y_pot[1204]=0.676487;
+        y_pot[1205]=0.676952;y_pot[1206]=0.677417;y_pot[1207]=0.677882;y_pot[1208]=0.678347;y_pot[1209]=0.678812;
+        y_pot[1210]=0.679277;y_pot[1211]=0.679741;y_pot[1212]=0.680206;y_pot[1213]=0.680671;y_pot[1214]=0.681135;
+        y_pot[1215]=0.6816;y_pot[1216]=0.682064;y_pot[1217]=0.682528;y_pot[1218]=0.682992;y_pot[1219]=0.683456;
+        y_pot[1220]=0.68392;y_pot[1221]=0.684384;y_pot[1222]=0.684848;y_pot[1223]=0.685312;y_pot[1224]=0.685776;
+        y_pot[1225]=0.686239;y_pot[1226]=0.686703;y_pot[1227]=0.687167;y_pot[1228]=0.68763;y_pot[1229]=0.688094;
+        y_pot[1230]=0.688557;y_pot[1231]=0.68902;y_pot[1232]=0.689484;y_pot[1233]=0.689947;y_pot[1234]=0.69041;
+        y_pot[1235]=0.690874;y_pot[1236]=0.691337;y_pot[1237]=0.6918;y_pot[1238]=0.692264;y_pot[1239]=0.692727;
+        y_pot[1240]=0.69319;y_pot[1241]=0.693653;y_pot[1242]=0.694117;y_pot[1243]=0.69458;y_pot[1244]=0.695043;
+        y_pot[1245]=0.695507;y_pot[1246]=0.69597;y_pot[1247]=0.696434;y_pot[1248]=0.696897;y_pot[1249]=0.69736;
+        y_pot[1250]=0.697824;y_pot[1251]=0.698287;y_pot[1252]=0.698751;y_pot[1253]=0.699214;y_pot[1254]=0.699678;
+        y_pot[1255]=0.700142;y_pot[1256]=0.700605;y_pot[1257]=0.701069;y_pot[1258]=0.701532;y_pot[1259]=0.701996;
+        y_pot[1260]=0.70246;y_pot[1261]=0.702923;y_pot[1262]=0.703387;y_pot[1263]=0.70385;y_pot[1264]=0.704314;
+        y_pot[1265]=0.704778;y_pot[1266]=0.705241;y_pot[1267]=0.705705;y_pot[1268]=0.706168;y_pot[1269]=0.706632;
+        y_pot[1270]=0.707095;y_pot[1271]=0.707558;y_pot[1272]=0.708021;y_pot[1273]=0.708485;y_pot[1274]=0.708948;
+        y_pot[1275]=0.709411;y_pot[1276]=0.709874;y_pot[1277]=0.710337;y_pot[1278]=0.7108;y_pot[1279]=0.711262;
+        y_pot[1280]=0.711725;y_pot[1281]=0.712187;y_pot[1282]=0.71265;y_pot[1283]=0.713112;y_pot[1284]=0.713575;
+        y_pot[1285]=0.714037;y_pot[1286]=0.714499;y_pot[1287]=0.714961;y_pot[1288]=0.715423;y_pot[1289]=0.715885;
+        y_pot[1290]=0.716347;y_pot[1291]=0.716808;y_pot[1292]=0.71727;y_pot[1293]=0.717732;y_pot[1294]=0.718193;
+        y_pot[1295]=0.718655;y_pot[1296]=0.719116;y_pot[1297]=0.719577;y_pot[1298]=0.720039;y_pot[1299]=0.7205;
+        y_pot[1300]=0.720961;y_pot[1301]=0.721422;y_pot[1302]=0.721884;y_pot[1303]=0.722345;y_pot[1304]=0.722806;
+        y_pot[1305]=0.723267;y_pot[1306]=0.723728;y_pot[1307]=0.724189;y_pot[1308]=0.72465;y_pot[1309]=0.725111;
+        y_pot[1310]=0.725572;y_pot[1311]=0.726034;y_pot[1312]=0.726495;y_pot[1313]=0.726956;y_pot[1314]=0.727417;
+        y_pot[1315]=0.727878;y_pot[1316]=0.728339;y_pot[1317]=0.7288;y_pot[1318]=0.729262;y_pot[1319]=0.729723;
+        y_pot[1320]=0.730184;y_pot[1321]=0.730645;y_pot[1322]=0.731106;y_pot[1323]=0.731568;y_pot[1324]=0.732029;
+        y_pot[1325]=0.73249;y_pot[1326]=0.732951;y_pot[1327]=0.733413;y_pot[1328]=0.733874;y_pot[1329]=0.734335;
+        y_pot[1330]=0.734796;y_pot[1331]=0.735257;y_pot[1332]=0.735719;y_pot[1333]=0.73618;y_pot[1334]=0.736641;
+        y_pot[1335]=0.737102;y_pot[1336]=0.737563;y_pot[1337]=0.738024;y_pot[1338]=0.738484;y_pot[1339]=0.738945;
+        y_pot[1340]=0.739406;y_pot[1341]=0.739866;y_pot[1342]=0.740327;y_pot[1343]=0.740787;y_pot[1344]=0.741248;
+        y_pot[1345]=0.741708;y_pot[1346]=0.742168;y_pot[1347]=0.742628;y_pot[1348]=0.743088;y_pot[1349]=0.743548;
+        y_pot[1350]=0.744008;y_pot[1351]=0.744468;y_pot[1352]=0.744927;y_pot[1353]=0.745387;y_pot[1354]=0.745846;
+        y_pot[1355]=0.746306;y_pot[1356]=0.746765;y_pot[1357]=0.747224;y_pot[1358]=0.747683;y_pot[1359]=0.748142;
+        y_pot[1360]=0.748601;y_pot[1361]=0.74906;y_pot[1362]=0.749518;y_pot[1363]=0.749977;y_pot[1364]=0.750436;
+        y_pot[1365]=0.750894;y_pot[1366]=0.751352;y_pot[1367]=0.751811;y_pot[1368]=0.752269;y_pot[1369]=0.752728;
+        y_pot[1370]=0.753186;y_pot[1371]=0.753644;y_pot[1372]=0.754102;y_pot[1373]=0.75456;y_pot[1374]=0.755019;
+        y_pot[1375]=0.755477;y_pot[1376]=0.755935;y_pot[1377]=0.756393;y_pot[1378]=0.756851;y_pot[1379]=0.757309;
+        y_pot[1380]=0.757767;y_pot[1381]=0.758225;y_pot[1382]=0.758683;y_pot[1383]=0.759141;y_pot[1384]=0.759599;
+        y_pot[1385]=0.760058;y_pot[1386]=0.760516;y_pot[1387]=0.760974;y_pot[1388]=0.761432;y_pot[1389]=0.76189;
+        y_pot[1390]=0.762348;y_pot[1391]=0.762806;y_pot[1392]=0.763264;y_pot[1393]=0.763722;y_pot[1394]=0.76418;
+        y_pot[1395]=0.764638;y_pot[1396]=0.765096;y_pot[1397]=0.765554;y_pot[1398]=0.766012;y_pot[1399]=0.76647;
+        y_pot[1400]=0.766928;y_pot[1401]=0.767385;y_pot[1402]=0.767843;y_pot[1403]=0.768301;y_pot[1404]=0.768758;
+        y_pot[1405]=0.769216;y_pot[1406]=0.769673;y_pot[1407]=0.77013;y_pot[1408]=0.770588;y_pot[1409]=0.771045;
+        y_pot[1410]=0.771502;y_pot[1411]=0.771959;y_pot[1412]=0.772415;y_pot[1413]=0.772872;y_pot[1414]=0.773329;
+        y_pot[1415]=0.773785;y_pot[1416]=0.774242;y_pot[1417]=0.774698;y_pot[1418]=0.775154;y_pot[1419]=0.77561;
+        y_pot[1420]=0.776066;y_pot[1421]=0.776522;y_pot[1422]=0.776977;y_pot[1423]=0.777433;y_pot[1424]=0.777889;
+        y_pot[1425]=0.778344;y_pot[1426]=0.778799;y_pot[1427]=0.779254;y_pot[1428]=0.779709;y_pot[1429]=0.780164;
+        y_pot[1430]=0.780619;y_pot[1431]=0.781074;y_pot[1432]=0.781528;y_pot[1433]=0.781983;y_pot[1434]=0.782438;
+        y_pot[1435]=0.782892;y_pot[1436]=0.783346;y_pot[1437]=0.783801;y_pot[1438]=0.784255;y_pot[1439]=0.784709;
+        y_pot[1440]=0.785163;y_pot[1441]=0.785618;y_pot[1442]=0.786072;y_pot[1443]=0.786526;y_pot[1444]=0.78698;
+        y_pot[1445]=0.787434;y_pot[1446]=0.787888;y_pot[1447]=0.788342;y_pot[1448]=0.788795;y_pot[1449]=0.789249;
+        y_pot[1450]=0.789703;y_pot[1451]=0.790157;y_pot[1452]=0.790611;y_pot[1453]=0.791065;y_pot[1454]=0.791518;
+        y_pot[1455]=0.791972;y_pot[1456]=0.792426;y_pot[1457]=0.79288;y_pot[1458]=0.793333;y_pot[1459]=0.793787;
+        y_pot[1460]=0.79424;y_pot[1461]=0.794694;y_pot[1462]=0.795148;y_pot[1463]=0.795601;y_pot[1464]=0.796054;
+        y_pot[1465]=0.796508;y_pot[1466]=0.796961;y_pot[1467]=0.797414;y_pot[1468]=0.797867;y_pot[1469]=0.79832;
+        y_pot[1470]=0.798773;y_pot[1471]=0.799226;y_pot[1472]=0.799679;y_pot[1473]=0.800132;y_pot[1474]=0.800584;
+        y_pot[1475]=0.801037;y_pot[1476]=0.801489;y_pot[1477]=0.801942;y_pot[1478]=0.802394;y_pot[1479]=0.802846;
+        y_pot[1480]=0.803297;y_pot[1481]=0.803749;y_pot[1482]=0.804201;y_pot[1483]=0.804652;y_pot[1484]=0.805103;
+        y_pot[1485]=0.805555;y_pot[1486]=0.806006;y_pot[1487]=0.806457;y_pot[1488]=0.806907;y_pot[1489]=0.807358;
+        y_pot[1490]=0.807808;y_pot[1491]=0.808259;y_pot[1492]=0.808709;y_pot[1493]=0.809159;y_pot[1494]=0.809609;
+        y_pot[1495]=0.810058;y_pot[1496]=0.810508;y_pot[1497]=0.810958;y_pot[1498]=0.811407;y_pot[1499]=0.811856;
+        y_pot[1500]=0.812305;y_pot[1501]=0.812754;y_pot[1502]=0.813203;y_pot[1503]=0.813652;y_pot[1504]=0.814101;
+        y_pot[1505]=0.81455;y_pot[1506]=0.814998;y_pot[1507]=0.815447;y_pot[1508]=0.815895;y_pot[1509]=0.816343;
+        y_pot[1510]=0.816792;y_pot[1511]=0.81724;y_pot[1512]=0.817688;y_pot[1513]=0.818136;y_pot[1514]=0.818584;
+        y_pot[1515]=0.819032;y_pot[1516]=0.81948;y_pot[1517]=0.819928;y_pot[1518]=0.820376;y_pot[1519]=0.820823;
+        y_pot[1520]=0.821271;y_pot[1521]=0.821719;y_pot[1522]=0.822166;y_pot[1523]=0.822614;y_pot[1524]=0.823061;
+        y_pot[1525]=0.823508;y_pot[1526]=0.823956;y_pot[1527]=0.824403;y_pot[1528]=0.82485;y_pot[1529]=0.825297;
+        y_pot[1530]=0.825744;y_pot[1531]=0.826191;y_pot[1532]=0.826638;y_pot[1533]=0.827085;y_pot[1534]=0.827531;
+        y_pot[1535]=0.827978;y_pot[1536]=0.828424;y_pot[1537]=0.82887;y_pot[1538]=0.829317;y_pot[1539]=0.829763;
+        y_pot[1540]=0.830208;y_pot[1541]=0.830654;y_pot[1542]=0.8311;y_pot[1543]=0.831545;y_pot[1544]=0.83199;
+        y_pot[1545]=0.832435;y_pot[1546]=0.83288;y_pot[1547]=0.833325;y_pot[1548]=0.83377;y_pot[1549]=0.834214;
+        y_pot[1550]=0.834658;y_pot[1551]=0.835102;y_pot[1552]=0.835546;y_pot[1553]=0.83599;y_pot[1554]=0.836433;
+        y_pot[1555]=0.836876;y_pot[1556]=0.837319;y_pot[1557]=0.837762;y_pot[1558]=0.838205;y_pot[1559]=0.838648;
+        y_pot[1560]=0.83909;y_pot[1561]=0.839532;y_pot[1562]=0.839974;y_pot[1563]=0.840416;y_pot[1564]=0.840857;
+        y_pot[1565]=0.841299;y_pot[1566]=0.84174;y_pot[1567]=0.842181;y_pot[1568]=0.842622;y_pot[1569]=0.843063;
+        y_pot[1570]=0.843503;y_pot[1571]=0.843944;y_pot[1572]=0.844384;y_pot[1573]=0.844824;y_pot[1574]=0.845264;
+        y_pot[1575]=0.845704;y_pot[1576]=0.846144;y_pot[1577]=0.846584;y_pot[1578]=0.847023;y_pot[1579]=0.847463;
+        y_pot[1580]=0.847902;y_pot[1581]=0.848341;y_pot[1582]=0.84878;y_pot[1583]=0.849219;y_pot[1584]=0.849658;
+        y_pot[1585]=0.850096;y_pot[1586]=0.850535;y_pot[1587]=0.850973;y_pot[1588]=0.851412;y_pot[1589]=0.85185;
+        y_pot[1590]=0.852288;y_pot[1591]=0.852726;y_pot[1592]=0.853164;y_pot[1593]=0.853601;y_pot[1594]=0.854039;
+        y_pot[1595]=0.854476;y_pot[1596]=0.854914;y_pot[1597]=0.855351;y_pot[1598]=0.855788;y_pot[1599]=0.856225;
+        y_pot[1600]=0.856661;y_pot[1601]=0.857098;y_pot[1602]=0.857534;y_pot[1603]=0.85797;y_pot[1604]=0.858406;
+        y_pot[1605]=0.858842;y_pot[1606]=0.859277;y_pot[1607]=0.859713;y_pot[1608]=0.860148;y_pot[1609]=0.860583;
+        y_pot[1610]=0.861017;y_pot[1611]=0.861452;y_pot[1612]=0.861886;y_pot[1613]=0.86232;y_pot[1614]=0.862753;
+        y_pot[1615]=0.863187;y_pot[1616]=0.86362;y_pot[1617]=0.864053;y_pot[1618]=0.864485;y_pot[1619]=0.864918;
+        y_pot[1620]=0.86535;y_pot[1621]=0.865782;y_pot[1622]=0.866213;y_pot[1623]=0.866644;y_pot[1624]=0.867075;
+        y_pot[1625]=0.867506;y_pot[1626]=0.867936;y_pot[1627]=0.868366;y_pot[1628]=0.868796;y_pot[1629]=0.869226;
+        y_pot[1630]=0.869655;y_pot[1631]=0.870084;y_pot[1632]=0.870513;y_pot[1633]=0.870941;y_pot[1634]=0.87137;
+        y_pot[1635]=0.871798;y_pot[1636]=0.872225;y_pot[1637]=0.872653;y_pot[1638]=0.87308;y_pot[1639]=0.873507;
+        y_pot[1640]=0.873933;y_pot[1641]=0.87436;y_pot[1642]=0.874786;y_pot[1643]=0.875212;y_pot[1644]=0.875638;
+        y_pot[1645]=0.876063;y_pot[1646]=0.876488;y_pot[1647]=0.876913;y_pot[1648]=0.877338;y_pot[1649]=0.877762;
+        y_pot[1650]=0.878187;y_pot[1651]=0.878611;y_pot[1652]=0.879034;y_pot[1653]=0.879458;y_pot[1654]=0.879881;
+        y_pot[1655]=0.880304;y_pot[1656]=0.880727;y_pot[1657]=0.88115;y_pot[1658]=0.881572;y_pot[1659]=0.881994;
+        y_pot[1660]=0.882416;y_pot[1661]=0.882838;y_pot[1662]=0.883259;y_pot[1663]=0.88368;y_pot[1664]=0.8841;
+        y_pot[1665]=0.884521;y_pot[1666]=0.884941;y_pot[1667]=0.885361;y_pot[1668]=0.88578;y_pot[1669]=0.886199;
+        y_pot[1670]=0.886618;y_pot[1671]=0.887037;y_pot[1672]=0.887455;y_pot[1673]=0.887873;y_pot[1674]=0.88829;
+        y_pot[1675]=0.888707;y_pot[1676]=0.889124;y_pot[1677]=0.88954;y_pot[1678]=0.889956;y_pot[1679]=0.890372;
+        y_pot[1680]=0.890787;y_pot[1681]=0.891201;y_pot[1682]=0.891616;y_pot[1683]=0.892029;y_pot[1684]=0.892443;
+        y_pot[1685]=0.892856;y_pot[1686]=0.893268;y_pot[1687]=0.89368;y_pot[1688]=0.894092;y_pot[1689]=0.894503;
+        y_pot[1690]=0.894913;y_pot[1691]=0.895323;y_pot[1692]=0.895733;y_pot[1693]=0.896142;y_pot[1694]=0.896551;
+        y_pot[1695]=0.896959;y_pot[1696]=0.897367;y_pot[1697]=0.897774;y_pot[1698]=0.898181;y_pot[1699]=0.898587;
+        y_pot[1700]=0.898993;y_pot[1701]=0.899398;y_pot[1702]=0.899803;y_pot[1703]=0.900207;y_pot[1704]=0.900611;
+        y_pot[1705]=0.901015;y_pot[1706]=0.901417;y_pot[1707]=0.90182;y_pot[1708]=0.902222;y_pot[1709]=0.902623;
+        y_pot[1710]=0.903024;y_pot[1711]=0.903424;y_pot[1712]=0.903824;y_pot[1713]=0.904224;y_pot[1714]=0.904622;
+        y_pot[1715]=0.905021;y_pot[1716]=0.905419;y_pot[1717]=0.905816;y_pot[1718]=0.906213;y_pot[1719]=0.906609;
+        y_pot[1720]=0.907005;y_pot[1721]=0.9074;y_pot[1722]=0.907795;y_pot[1723]=0.908189;y_pot[1724]=0.908583;
+        y_pot[1725]=0.908976;y_pot[1726]=0.909369;y_pot[1727]=0.909761;y_pot[1728]=0.910152;y_pot[1729]=0.910543;
+        y_pot[1730]=0.910933;y_pot[1731]=0.911322;y_pot[1732]=0.911711;y_pot[1733]=0.9121;y_pot[1734]=0.912487;
+        y_pot[1735]=0.912874;y_pot[1736]=0.913261;y_pot[1737]=0.913646;y_pot[1738]=0.914031;y_pot[1739]=0.914415;
+        y_pot[1740]=0.914799;y_pot[1741]=0.915182;y_pot[1742]=0.915564;y_pot[1743]=0.915945;y_pot[1744]=0.916325;
+        y_pot[1745]=0.916705;y_pot[1746]=0.917084;y_pot[1747]=0.917462;y_pot[1748]=0.917839;y_pot[1749]=0.918215;
+        y_pot[1750]=0.918591;y_pot[1751]=0.918965;y_pot[1752]=0.919339;y_pot[1753]=0.919711;y_pot[1754]=0.920083;
+        y_pot[1755]=0.920454;y_pot[1756]=0.920824;y_pot[1757]=0.921193;y_pot[1758]=0.921561;y_pot[1759]=0.921928;
+        y_pot[1760]=0.922294;y_pot[1761]=0.922659;y_pot[1762]=0.923023;y_pot[1763]=0.923386;y_pot[1764]=0.923748;
+        y_pot[1765]=0.924109;y_pot[1766]=0.924469;y_pot[1767]=0.924828;y_pot[1768]=0.925186;y_pot[1769]=0.925543;
+        y_pot[1770]=0.925898;y_pot[1771]=0.926253;y_pot[1772]=0.926606;y_pot[1773]=0.926959;y_pot[1774]=0.92731;
+        y_pot[1775]=0.92766;y_pot[1776]=0.928009;y_pot[1777]=0.928357;y_pot[1778]=0.928704;y_pot[1779]=0.929049;
+        y_pot[1780]=0.929394;y_pot[1781]=0.929737;y_pot[1782]=0.930079;y_pot[1783]=0.93042;y_pot[1784]=0.930759;
+        y_pot[1785]=0.931097;y_pot[1786]=0.931434;y_pot[1787]=0.93177;y_pot[1788]=0.932105;y_pot[1789]=0.932438;
+        y_pot[1790]=0.93277;y_pot[1791]=0.9331;y_pot[1792]=0.933429;y_pot[1793]=0.933757;y_pot[1794]=0.934084;
+        y_pot[1795]=0.934409;y_pot[1796]=0.934732;y_pot[1797]=0.935054;y_pot[1798]=0.935375;y_pot[1799]=0.935694;
+        y_pot[1800]=0.936012;y_pot[1801]=0.936328;y_pot[1802]=0.936642;y_pot[1803]=0.936955;y_pot[1804]=0.937267;
+        y_pot[1805]=0.937576;y_pot[1806]=0.937885;y_pot[1807]=0.938191;y_pot[1808]=0.938496;y_pot[1809]=0.938799;
+        y_pot[1810]=0.9391;y_pot[1811]=0.939399;y_pot[1812]=0.939697;y_pot[1813]=0.939993;y_pot[1814]=0.940287;
+        y_pot[1815]=0.940579;y_pot[1816]=0.940869;y_pot[1817]=0.941158;y_pot[1818]=0.941444;y_pot[1819]=0.941729;
+        y_pot[1820]=0.942012;y_pot[1821]=0.942292;y_pot[1822]=0.942571;y_pot[1823]=0.942848;y_pot[1824]=0.943122;
+        y_pot[1825]=0.943395;y_pot[1826]=0.943665;y_pot[1827]=0.943934;y_pot[1828]=0.9442;y_pot[1829]=0.944465;
+        y_pot[1830]=0.944727;y_pot[1831]=0.944987;y_pot[1832]=0.945245;y_pot[1833]=0.945501;y_pot[1834]=0.945755;
+        y_pot[1835]=0.946007;y_pot[1836]=0.946256;y_pot[1837]=0.946504;y_pot[1838]=0.946749;y_pot[1839]=0.946993;
+        y_pot[1840]=0.947234;y_pot[1841]=0.947473;y_pot[1842]=0.94771;y_pot[1843]=0.947945;y_pot[1844]=0.948177;
+        y_pot[1845]=0.948408;y_pot[1846]=0.948636;y_pot[1847]=0.948863;y_pot[1848]=0.949087;y_pot[1849]=0.949309;
+        y_pot[1850]=0.949529;y_pot[1851]=0.949748;y_pot[1852]=0.949964;y_pot[1853]=0.950178;y_pot[1854]=0.95039;
+        y_pot[1855]=0.9506;y_pot[1856]=0.950808;y_pot[1857]=0.951014;y_pot[1858]=0.951218;y_pot[1859]=0.95142;
+        y_pot[1860]=0.951621;y_pot[1861]=0.951819;y_pot[1862]=0.952015;y_pot[1863]=0.95221;y_pot[1864]=0.952403;
+        y_pot[1865]=0.952594;y_pot[1866]=0.952783;y_pot[1867]=0.95297;y_pot[1868]=0.953155;y_pot[1869]=0.953339;
+        y_pot[1870]=0.95352;y_pot[1871]=0.953701;y_pot[1872]=0.953879;y_pot[1873]=0.954056;y_pot[1874]=0.954231;
+        y_pot[1875]=0.954404;y_pot[1876]=0.954575;y_pot[1877]=0.954745;y_pot[1878]=0.954914;y_pot[1879]=0.955081;
+        y_pot[1880]=0.955246;y_pot[1881]=0.955409;y_pot[1882]=0.955571;y_pot[1883]=0.955732;y_pot[1884]=0.955891;
+        y_pot[1885]=0.956048;y_pot[1886]=0.956205;y_pot[1887]=0.956359;y_pot[1888]=0.956512;y_pot[1889]=0.956664;
+        y_pot[1890]=0.956814;y_pot[1891]=0.956963;y_pot[1892]=0.957111;y_pot[1893]=0.957257;y_pot[1894]=0.957402;
+        y_pot[1895]=0.957546;y_pot[1896]=0.957688;y_pot[1897]=0.957829;y_pot[1898]=0.957968;y_pot[1899]=0.958107;
+        y_pot[1900]=0.958244;y_pot[1901]=0.95838;y_pot[1902]=0.958515;y_pot[1903]=0.958649;y_pot[1904]=0.958781;
+        y_pot[1905]=0.958912;y_pot[1906]=0.959042;y_pot[1907]=0.959171;y_pot[1908]=0.959299;y_pot[1909]=0.959426;
+        y_pot[1910]=0.959551;y_pot[1911]=0.959676;y_pot[1912]=0.9598;y_pot[1913]=0.959922;y_pot[1914]=0.960043;
+        y_pot[1915]=0.960164;y_pot[1916]=0.960283;y_pot[1917]=0.960402;y_pot[1918]=0.960519;y_pot[1919]=0.960636;
+        y_pot[1920]=0.960751;y_pot[1921]=0.960866;y_pot[1922]=0.960979;y_pot[1923]=0.961092;y_pot[1924]=0.961204;
+        y_pot[1925]=0.961315;y_pot[1926]=0.961425;y_pot[1927]=0.961534;y_pot[1928]=0.961642;y_pot[1929]=0.961749;
+        y_pot[1930]=0.961856;y_pot[1931]=0.961962;y_pot[1932]=0.962067;y_pot[1933]=0.962171;y_pot[1934]=0.962274;
+        y_pot[1935]=0.962376;y_pot[1936]=0.962478;y_pot[1937]=0.962579;y_pot[1938]=0.962679;y_pot[1939]=0.962779;
+        y_pot[1940]=0.962877;y_pot[1941]=0.962975;y_pot[1942]=0.963072;y_pot[1943]=0.963169;y_pot[1944]=0.963265;
+        y_pot[1945]=0.96336;y_pot[1946]=0.963454;y_pot[1947]=0.963548;y_pot[1948]=0.963641;y_pot[1949]=0.963733;
+        y_pot[1950]=0.963825;y_pot[1951]=0.963916;y_pot[1952]=0.964006;y_pot[1953]=0.964096;y_pot[1954]=0.964185;
+        y_pot[1955]=0.964273;y_pot[1956]=0.964361;y_pot[1957]=0.964448;y_pot[1958]=0.964535;y_pot[1959]=0.964621;
+        y_pot[1960]=0.964707;y_pot[1961]=0.964792;y_pot[1962]=0.964876;y_pot[1963]=0.96496;y_pot[1964]=0.965043;
+        y_pot[1965]=0.965125;y_pot[1966]=0.965207;y_pot[1967]=0.965289;y_pot[1968]=0.96537;y_pot[1969]=0.96545;
+        y_pot[1970]=0.96553;y_pot[1971]=0.96561;y_pot[1972]=0.965689;y_pot[1973]=0.965767;y_pot[1974]=0.965845;
+        y_pot[1975]=0.965922;y_pot[1976]=0.965999;y_pot[1977]=0.966076;y_pot[1978]=0.966152;y_pot[1979]=0.966227;
+        y_pot[1980]=0.966302;y_pot[1981]=0.966376;y_pot[1982]=0.966451;y_pot[1983]=0.966524;y_pot[1984]=0.966597;
+        y_pot[1985]=0.96667;y_pot[1986]=0.966742;y_pot[1987]=0.966814;y_pot[1988]=0.966885;y_pot[1989]=0.966956;
+        y_pot[1990]=0.967027;y_pot[1991]=0.967097;y_pot[1992]=0.967167;y_pot[1993]=0.967236;y_pot[1994]=0.967305;
+        y_pot[1995]=0.967373;y_pot[1996]=0.967441;y_pot[1997]=0.967509;y_pot[1998]=0.967576;y_pot[1999]=0.967643;
+        y_pot[2000]=0.96771;y_pot[2001]=0.967776;y_pot[2002]=0.967842;y_pot[2003]=0.967907;y_pot[2004]=0.967972;
+        y_pot[2005]=0.968037;y_pot[2006]=0.968101;y_pot[2007]=0.968165;y_pot[2008]=0.968229;y_pot[2009]=0.968292;
+        y_pot[2010]=0.968355;y_pot[2011]=0.968417;y_pot[2012]=0.968479;y_pot[2013]=0.968541;y_pot[2014]=0.968603;
+        y_pot[2015]=0.968664;y_pot[2016]=0.968725;y_pot[2017]=0.968785;y_pot[2018]=0.968845;y_pot[2019]=0.968905;
+        y_pot[2020]=0.968965;y_pot[2021]=0.969024;y_pot[2022]=0.969083;y_pot[2023]=0.969142;y_pot[2024]=0.9692;
+        y_pot[2025]=0.969258;y_pot[2026]=0.969316;y_pot[2027]=0.969373;y_pot[2028]=0.96943;y_pot[2029]=0.969487;
+        y_pot[2030]=0.969544;y_pot[2031]=0.9696;y_pot[2032]=0.969656;y_pot[2033]=0.969712;y_pot[2034]=0.969767;
+        y_pot[2035]=0.969822;y_pot[2036]=0.969877;y_pot[2037]=0.969932;y_pot[2038]=0.969986;y_pot[2039]=0.97004;
+        y_pot[2040]=0.970094;y_pot[2041]=0.970148;y_pot[2042]=0.970201;y_pot[2043]=0.970254;y_pot[2044]=0.970307;
+        y_pot[2045]=0.970359;y_pot[2046]=0.970411;y_pot[2047]=0.970463;y_pot[2048]=0.970515;y_pot[2049]=0.970567;
+        y_pot[2050]=0.970618;y_pot[2051]=0.970669;y_pot[2052]=0.97072;y_pot[2053]=0.97077;y_pot[2054]=0.970821;
+        y_pot[2055]=0.970871;y_pot[2056]=0.970921;y_pot[2057]=0.97097;y_pot[2058]=0.97102;y_pot[2059]=0.971069;
+        y_pot[2060]=0.971118;y_pot[2061]=0.971166;y_pot[2062]=0.971215;y_pot[2063]=0.971263;y_pot[2064]=0.971311;
+        y_pot[2065]=0.971359;y_pot[2066]=0.971407;y_pot[2067]=0.971454;y_pot[2068]=0.971501;y_pot[2069]=0.971548;
+        y_pot[2070]=0.971595;y_pot[2071]=0.971642;y_pot[2072]=0.971688;y_pot[2073]=0.971734;y_pot[2074]=0.97178;
+        y_pot[2075]=0.971826;y_pot[2076]=0.971871;y_pot[2077]=0.971917;y_pot[2078]=0.971962;y_pot[2079]=0.972007;
+        y_pot[2080]=0.972052;y_pot[2081]=0.972096;y_pot[2082]=0.972141;y_pot[2083]=0.972185;y_pot[2084]=0.972229;
+        y_pot[2085]=0.972273;y_pot[2086]=0.972317;y_pot[2087]=0.97236;y_pot[2088]=0.972403;y_pot[2089]=0.972447;
+        y_pot[2090]=0.97249;y_pot[2091]=0.972532;y_pot[2092]=0.972575;y_pot[2093]=0.972617;y_pot[2094]=0.97266;
+        y_pot[2095]=0.972702;y_pot[2096]=0.972744;y_pot[2097]=0.972785;y_pot[2098]=0.972827;y_pot[2099]=0.972868;
+        y_pot[2100]=0.97291;y_pot[2101]=0.972951;y_pot[2102]=0.972991;y_pot[2103]=0.973032;y_pot[2104]=0.973073;
+        y_pot[2105]=0.973113;y_pot[2106]=0.973153;y_pot[2107]=0.973194;y_pot[2108]=0.973234;y_pot[2109]=0.973273;
+        y_pot[2110]=0.973313;y_pot[2111]=0.973352;y_pot[2112]=0.973392;y_pot[2113]=0.973431;y_pot[2114]=0.97347;
+        y_pot[2115]=0.973509;y_pot[2116]=0.973548;y_pot[2117]=0.973586;y_pot[2118]=0.973625;y_pot[2119]=0.973663;
+        y_pot[2120]=0.973701;y_pot[2121]=0.973739;y_pot[2122]=0.973777;y_pot[2123]=0.973815;y_pot[2124]=0.973852;
+        y_pot[2125]=0.97389;y_pot[2126]=0.973927;y_pot[2127]=0.973964;y_pot[2128]=0.974001;y_pot[2129]=0.974038;
+        y_pot[2130]=0.974075;y_pot[2131]=0.974111;y_pot[2132]=0.974148;y_pot[2133]=0.974184;y_pot[2134]=0.97422;
+        y_pot[2135]=0.974256;y_pot[2136]=0.974292;y_pot[2137]=0.974328;y_pot[2138]=0.974364;y_pot[2139]=0.974399;
+        y_pot[2140]=0.974435;y_pot[2141]=0.97447;y_pot[2142]=0.974505;y_pot[2143]=0.97454;y_pot[2144]=0.974575;
+        y_pot[2145]=0.97461;y_pot[2146]=0.974645;y_pot[2147]=0.974679;y_pot[2148]=0.974714;y_pot[2149]=0.974748;
+        y_pot[2150]=0.974782;y_pot[2151]=0.974816;y_pot[2152]=0.97485;y_pot[2153]=0.974884;y_pot[2154]=0.974918;
+        y_pot[2155]=0.974951;y_pot[2156]=0.974985;y_pot[2157]=0.975018;y_pot[2158]=0.975052;y_pot[2159]=0.975085;
+        y_pot[2160]=0.975118;y_pot[2161]=0.975151;y_pot[2162]=0.975184;y_pot[2163]=0.975216;y_pot[2164]=0.975249;
+        y_pot[2165]=0.975281;y_pot[2166]=0.975314;y_pot[2167]=0.975346;y_pot[2168]=0.975378;y_pot[2169]=0.97541;
+        y_pot[2170]=0.975442;y_pot[2171]=0.975474;y_pot[2172]=0.975506;y_pot[2173]=0.975537;y_pot[2174]=0.975569;
+        y_pot[2175]=0.9756;y_pot[2176]=0.975632;y_pot[2177]=0.975663;y_pot[2178]=0.975694;y_pot[2179]=0.975725;
+        y_pot[2180]=0.975756;y_pot[2181]=0.975787;y_pot[2182]=0.975818;y_pot[2183]=0.975848;y_pot[2184]=0.975879;
+        y_pot[2185]=0.975909;y_pot[2186]=0.975939;y_pot[2187]=0.97597;y_pot[2188]=0.976;y_pot[2189]=0.97603;
+        y_pot[2190]=0.97606;y_pot[2191]=0.97609;y_pot[2192]=0.976119;y_pot[2193]=0.976149;y_pot[2194]=0.976179;
+        y_pot[2195]=0.976208;y_pot[2196]=0.976237;y_pot[2197]=0.976267;y_pot[2198]=0.976296;y_pot[2199]=0.976325;
+        y_pot[2200]=0.976354;y_pot[2201]=0.976383;y_pot[2202]=0.976412;y_pot[2203]=0.976441;y_pot[2204]=0.976469;
+        y_pot[2205]=0.976498;y_pot[2206]=0.976526;y_pot[2207]=0.976555;y_pot[2208]=0.976583;y_pot[2209]=0.976611;
+        y_pot[2210]=0.97664;y_pot[2211]=0.976668;y_pot[2212]=0.976696;y_pot[2213]=0.976723;y_pot[2214]=0.976751;
+        y_pot[2215]=0.976779;y_pot[2216]=0.976807;y_pot[2217]=0.976834;y_pot[2218]=0.976862;y_pot[2219]=0.976889;
+        y_pot[2220]=0.976916;y_pot[2221]=0.976944;y_pot[2222]=0.976971;y_pot[2223]=0.976998;y_pot[2224]=0.977025;
+        y_pot[2225]=0.977052;y_pot[2226]=0.977079;y_pot[2227]=0.977105;y_pot[2228]=0.977132;y_pot[2229]=0.977159;
+        y_pot[2230]=0.977185;y_pot[2231]=0.977212;y_pot[2232]=0.977238;y_pot[2233]=0.977264;y_pot[2234]=0.977291;
+        y_pot[2235]=0.977317;y_pot[2236]=0.977343;y_pot[2237]=0.977369;y_pot[2238]=0.977395;y_pot[2239]=0.977421;
+        y_pot[2240]=0.977447;y_pot[2241]=0.977472;y_pot[2242]=0.977498;y_pot[2243]=0.977523;y_pot[2244]=0.977549;
+        y_pot[2245]=0.977574;y_pot[2246]=0.9776;y_pot[2247]=0.977625;y_pot[2248]=0.97765;y_pot[2249]=0.977675;
+        y_pot[2250]=0.9777;y_pot[2251]=0.977725;y_pot[2252]=0.97775;y_pot[2253]=0.977775;y_pot[2254]=0.9778;
+        y_pot[2255]=0.977825;y_pot[2256]=0.977849;y_pot[2257]=0.977874;y_pot[2258]=0.977899;y_pot[2259]=0.977923;
+        y_pot[2260]=0.977947;y_pot[2261]=0.977972;y_pot[2262]=0.977996;y_pot[2263]=0.97802;y_pot[2264]=0.978044;
+        y_pot[2265]=0.978068;y_pot[2266]=0.978092;y_pot[2267]=0.978116;y_pot[2268]=0.97814;y_pot[2269]=0.978164;
+        y_pot[2270]=0.978188;y_pot[2271]=0.978211;y_pot[2272]=0.978235;y_pot[2273]=0.978259;y_pot[2274]=0.978282;
+        y_pot[2275]=0.978306;y_pot[2276]=0.978329;y_pot[2277]=0.978352;y_pot[2278]=0.978375;y_pot[2279]=0.978399;
+        y_pot[2280]=0.978422;y_pot[2281]=0.978445;y_pot[2282]=0.978468;y_pot[2283]=0.978491;y_pot[2284]=0.978514;
+        y_pot[2285]=0.978537;y_pot[2286]=0.978559;y_pot[2287]=0.978582;y_pot[2288]=0.978605;y_pot[2289]=0.978627;
+        y_pot[2290]=0.97865;y_pot[2291]=0.978672;y_pot[2292]=0.978695;y_pot[2293]=0.978717;y_pot[2294]=0.978739;
+        y_pot[2295]=0.978762;y_pot[2296]=0.978784;y_pot[2297]=0.978806;y_pot[2298]=0.978828;y_pot[2299]=0.97885;
+        y_pot[2300]=0.978872;y_pot[2301]=0.978894;y_pot[2302]=0.978916;y_pot[2303]=0.978938;y_pot[2304]=0.978959;
+        y_pot[2305]=0.978981;y_pot[2306]=0.979003;y_pot[2307]=0.979024;y_pot[2308]=0.979046;y_pot[2309]=0.979067;
+        y_pot[2310]=0.979089;y_pot[2311]=0.97911;y_pot[2312]=0.979131;y_pot[2313]=0.979153;y_pot[2314]=0.979174;
+        y_pot[2315]=0.979195;y_pot[2316]=0.979216;y_pot[2317]=0.979237;y_pot[2318]=0.979258;y_pot[2319]=0.979279;
+        y_pot[2320]=0.9793;y_pot[2321]=0.979321;y_pot[2322]=0.979342;y_pot[2323]=0.979362;y_pot[2324]=0.979383;
+        y_pot[2325]=0.979404;y_pot[2326]=0.979424;y_pot[2327]=0.979445;y_pot[2328]=0.979466;y_pot[2329]=0.979486;
+        y_pot[2330]=0.979506;y_pot[2331]=0.979527;y_pot[2332]=0.979547;y_pot[2333]=0.979567;y_pot[2334]=0.979588;
+        y_pot[2335]=0.979608;y_pot[2336]=0.979628;y_pot[2337]=0.979648;y_pot[2338]=0.979668;y_pot[2339]=0.979688;
+        y_pot[2340]=0.979708;y_pot[2341]=0.979728;y_pot[2342]=0.979748;y_pot[2343]=0.979767;y_pot[2344]=0.979787;
+        y_pot[2345]=0.979807;y_pot[2346]=0.979826;y_pot[2347]=0.979846;y_pot[2348]=0.979866;y_pot[2349]=0.979885;
+        y_pot[2350]=0.979905;y_pot[2351]=0.979924;y_pot[2352]=0.979943;y_pot[2353]=0.979963;y_pot[2354]=0.979982;
+        y_pot[2355]=0.980001;y_pot[2356]=0.98002;y_pot[2357]=0.98004;y_pot[2358]=0.980059;y_pot[2359]=0.980078;
+        y_pot[2360]=0.980097;y_pot[2361]=0.980116;y_pot[2362]=0.980135;y_pot[2363]=0.980154;y_pot[2364]=0.980172;
+        y_pot[2365]=0.980191;y_pot[2366]=0.98021;y_pot[2367]=0.980229;y_pot[2368]=0.980247;y_pot[2369]=0.980266;
+        y_pot[2370]=0.980285;y_pot[2371]=0.980303;y_pot[2372]=0.980322;y_pot[2373]=0.98034;y_pot[2374]=0.980359;
+        y_pot[2375]=0.980377;y_pot[2376]=0.980395;y_pot[2377]=0.980414;y_pot[2378]=0.980432;y_pot[2379]=0.98045;
+        y_pot[2380]=0.980468;y_pot[2381]=0.980487;y_pot[2382]=0.980505;y_pot[2383]=0.980523;y_pot[2384]=0.980541;
+        y_pot[2385]=0.980559;y_pot[2386]=0.980577;y_pot[2387]=0.980595;y_pot[2388]=0.980613;y_pot[2389]=0.98063;
+        y_pot[2390]=0.980648;y_pot[2391]=0.980666;y_pot[2392]=0.980684;y_pot[2393]=0.980701;y_pot[2394]=0.980719;
+        y_pot[2395]=0.980737;y_pot[2396]=0.980754;y_pot[2397]=0.980772;y_pot[2398]=0.980789;y_pot[2399]=0.980807;
+        y_pot[2400]=0.980824;y_pot[2401]=0.980841;y_pot[2402]=0.980859;y_pot[2403]=0.980876;y_pot[2404]=0.980893;
+        y_pot[2405]=0.980911;y_pot[2406]=0.980928;y_pot[2407]=0.980945;y_pot[2408]=0.980962;y_pot[2409]=0.980979;
+        y_pot[2410]=0.980996;y_pot[2411]=0.981013;y_pot[2412]=0.98103;y_pot[2413]=0.981047;y_pot[2414]=0.981064;
+        y_pot[2415]=0.981081;y_pot[2416]=0.981098;y_pot[2417]=0.981115;y_pot[2418]=0.981131;y_pot[2419]=0.981148;
+        y_pot[2420]=0.981165;y_pot[2421]=0.981181;y_pot[2422]=0.981198;y_pot[2423]=0.981215;y_pot[2424]=0.981231;
+        y_pot[2425]=0.981248;y_pot[2426]=0.981264;y_pot[2427]=0.981281;y_pot[2428]=0.981297;y_pot[2429]=0.981314;
+        y_pot[2430]=0.98133;y_pot[2431]=0.981346;y_pot[2432]=0.981363;y_pot[2433]=0.981379;y_pot[2434]=0.981395;
+        y_pot[2435]=0.981411;y_pot[2436]=0.981427;y_pot[2437]=0.981443;y_pot[2438]=0.98146;y_pot[2439]=0.981476;
+        y_pot[2440]=0.981492;y_pot[2441]=0.981508;y_pot[2442]=0.981524;y_pot[2443]=0.98154;y_pot[2444]=0.981555;
+        y_pot[2445]=0.981571;y_pot[2446]=0.981587;y_pot[2447]=0.981603;y_pot[2448]=0.981619;y_pot[2449]=0.981634;
+        y_pot[2450]=0.98165;y_pot[2451]=0.981666;y_pot[2452]=0.981682;y_pot[2453]=0.981697;y_pot[2454]=0.981713;
+        y_pot[2455]=0.981728;y_pot[2456]=0.981744;y_pot[2457]=0.981759;y_pot[2458]=0.981775;y_pot[2459]=0.98179;
+        y_pot[2460]=0.981806;y_pot[2461]=0.981821;y_pot[2462]=0.981836;y_pot[2463]=0.981852;y_pot[2464]=0.981867;
+        y_pot[2465]=0.981882;y_pot[2466]=0.981897;y_pot[2467]=0.981913;y_pot[2468]=0.981928;y_pot[2469]=0.981943;
+        y_pot[2470]=0.981958;y_pot[2471]=0.981973;y_pot[2472]=0.981988;y_pot[2473]=0.982003;y_pot[2474]=0.982018;
+        y_pot[2475]=0.982033;y_pot[2476]=0.982048;y_pot[2477]=0.982063;y_pot[2478]=0.982078;y_pot[2479]=0.982093;
+        y_pot[2480]=0.982107;y_pot[2481]=0.982122;y_pot[2482]=0.982137;y_pot[2483]=0.982152;y_pot[2484]=0.982166;
+        y_pot[2485]=0.982181;y_pot[2486]=0.982196;y_pot[2487]=0.98221;y_pot[2488]=0.982225;y_pot[2489]=0.982239;
+        y_pot[2490]=0.982254;y_pot[2491]=0.982268;y_pot[2492]=0.982283;y_pot[2493]=0.982297;y_pot[2494]=0.982312;
+        y_pot[2495]=0.982326;y_pot[2496]=0.982341;y_pot[2497]=0.982355;y_pot[2498]=0.982369;y_pot[2499]=0.982384;
+        y_pot[2500]=0.982398;y_pot[2501]=0.982412;y_pot[2502]=0.982426;y_pot[2503]=0.98244;y_pot[2504]=0.982455;
+        y_pot[2505]=0.982469;y_pot[2506]=0.982483;y_pot[2507]=0.982497;y_pot[2508]=0.982511;y_pot[2509]=0.982525;
+        y_pot[2510]=0.982539;y_pot[2511]=0.982553;y_pot[2512]=0.982567;y_pot[2513]=0.982581;y_pot[2514]=0.982595;
+        y_pot[2515]=0.982609;y_pot[2516]=0.982622;y_pot[2517]=0.982636;y_pot[2518]=0.98265;y_pot[2519]=0.982664;
+        y_pot[2520]=0.982678;y_pot[2521]=0.982691;y_pot[2522]=0.982705;y_pot[2523]=0.982719;y_pot[2524]=0.982732;
+        y_pot[2525]=0.982746;y_pot[2526]=0.98276;y_pot[2527]=0.982773;y_pot[2528]=0.982787;y_pot[2529]=0.9828;
+        y_pot[2530]=0.982814;y_pot[2531]=0.982827;y_pot[2532]=0.982841;y_pot[2533]=0.982854;y_pot[2534]=0.982867;
+        y_pot[2535]=0.982881;y_pot[2536]=0.982894;y_pot[2537]=0.982907;y_pot[2538]=0.982921;y_pot[2539]=0.982934;
+        y_pot[2540]=0.982947;y_pot[2541]=0.982961;y_pot[2542]=0.982974;y_pot[2543]=0.982987;y_pot[2544]=0.983;
+        y_pot[2545]=0.983013;y_pot[2546]=0.983026;y_pot[2547]=0.98304;y_pot[2548]=0.983053;y_pot[2549]=0.983066;
+        y_pot[2550]=0.983079;y_pot[2551]=0.983092;y_pot[2552]=0.983105;y_pot[2553]=0.983118;y_pot[2554]=0.983131;
+        y_pot[2555]=0.983143;y_pot[2556]=0.983156;y_pot[2557]=0.983169;y_pot[2558]=0.983182;y_pot[2559]=0.983195;
+        y_pot[2560]=0.983208;y_pot[2561]=0.98322;y_pot[2562]=0.983233;y_pot[2563]=0.983246;y_pot[2564]=0.983259;
+        y_pot[2565]=0.983271;y_pot[2566]=0.983284;y_pot[2567]=0.983297;y_pot[2568]=0.983309;y_pot[2569]=0.983322;
+        y_pot[2570]=0.983335;y_pot[2571]=0.983347;y_pot[2572]=0.98336;y_pot[2573]=0.983372;y_pot[2574]=0.983385;
+        y_pot[2575]=0.983397;y_pot[2576]=0.98341;y_pot[2577]=0.983422;y_pot[2578]=0.983434;y_pot[2579]=0.983447;
+        y_pot[2580]=0.983459;y_pot[2581]=0.983472;y_pot[2582]=0.983484;y_pot[2583]=0.983496;y_pot[2584]=0.983508;
+        y_pot[2585]=0.983521;y_pot[2586]=0.983533;y_pot[2587]=0.983545;y_pot[2588]=0.983557;y_pot[2589]=0.98357;
+        y_pot[2590]=0.983582;y_pot[2591]=0.983594;y_pot[2592]=0.983606;y_pot[2593]=0.983618;y_pot[2594]=0.98363;
+        y_pot[2595]=0.983642;y_pot[2596]=0.983654;y_pot[2597]=0.983666;y_pot[2598]=0.983678;y_pot[2599]=0.98369;
+        y_pot[2600]=0.983702;y_pot[2601]=0.983714;y_pot[2602]=0.983726;y_pot[2603]=0.983738;y_pot[2604]=0.98375;
+        y_pot[2605]=0.983762;y_pot[2606]=0.983774;y_pot[2607]=0.983785;y_pot[2608]=0.983797;y_pot[2609]=0.983809;
+        y_pot[2610]=0.983821;y_pot[2611]=0.983832;y_pot[2612]=0.983844;y_pot[2613]=0.983856;y_pot[2614]=0.983868;
+        y_pot[2615]=0.983879;y_pot[2616]=0.983891;y_pot[2617]=0.983903;y_pot[2618]=0.983914;y_pot[2619]=0.983926;
+        y_pot[2620]=0.983937;y_pot[2621]=0.983949;y_pot[2622]=0.98396;y_pot[2623]=0.983972;y_pot[2624]=0.983983;
+        y_pot[2625]=0.983995;y_pot[2626]=0.984006;y_pot[2627]=0.984018;y_pot[2628]=0.984029;y_pot[2629]=0.984041;
+        y_pot[2630]=0.984052;y_pot[2631]=0.984063;y_pot[2632]=0.984075;y_pot[2633]=0.984086;y_pot[2634]=0.984097;
+        y_pot[2635]=0.984109;y_pot[2636]=0.98412;y_pot[2637]=0.984131;y_pot[2638]=0.984143;y_pot[2639]=0.984154;
+        y_pot[2640]=0.984165;y_pot[2641]=0.984176;y_pot[2642]=0.984187;y_pot[2643]=0.984198;y_pot[2644]=0.98421;
+        y_pot[2645]=0.984221;y_pot[2646]=0.984232;y_pot[2647]=0.984243;y_pot[2648]=0.984254;y_pot[2649]=0.984265;
+        y_pot[2650]=0.984276;y_pot[2651]=0.984287;y_pot[2652]=0.984298;y_pot[2653]=0.984309;y_pot[2654]=0.98432;
+        y_pot[2655]=0.984331;y_pot[2656]=0.984342;y_pot[2657]=0.984353;y_pot[2658]=0.984364;y_pot[2659]=0.984375;
+        y_pot[2660]=0.984385;y_pot[2661]=0.984396;y_pot[2662]=0.984407;y_pot[2663]=0.984418;y_pot[2664]=0.984429;
+        y_pot[2665]=0.984439;y_pot[2666]=0.98445;y_pot[2667]=0.984461;y_pot[2668]=0.984472;y_pot[2669]=0.984482;
+        y_pot[2670]=0.984493;y_pot[2671]=0.984504;y_pot[2672]=0.984514;y_pot[2673]=0.984525;y_pot[2674]=0.984536;
+        y_pot[2675]=0.984546;y_pot[2676]=0.984557;y_pot[2677]=0.984567;y_pot[2678]=0.984578;y_pot[2679]=0.984589;
+        y_pot[2680]=0.984599;y_pot[2681]=0.98461;y_pot[2682]=0.98462;y_pot[2683]=0.984631;y_pot[2684]=0.984641;
+        y_pot[2685]=0.984652;y_pot[2686]=0.984662;y_pot[2687]=0.984672;y_pot[2688]=0.984683;y_pot[2689]=0.984693;
+        y_pot[2690]=0.984704;y_pot[2691]=0.984714;y_pot[2692]=0.984724;y_pot[2693]=0.984735;y_pot[2694]=0.984745;
+        y_pot[2695]=0.984755;y_pot[2696]=0.984765;y_pot[2697]=0.984776;y_pot[2698]=0.984786;y_pot[2699]=0.984796;
+        y_pot[2700]=0.984806;y_pot[2701]=0.984817;y_pot[2702]=0.984827;y_pot[2703]=0.984837;y_pot[2704]=0.984847;
+        y_pot[2705]=0.984857;y_pot[2706]=0.984867;y_pot[2707]=0.984877;y_pot[2708]=0.984888;y_pot[2709]=0.984898;
+        y_pot[2710]=0.984908;y_pot[2711]=0.984918;y_pot[2712]=0.984928;y_pot[2713]=0.984938;y_pot[2714]=0.984948;
+        y_pot[2715]=0.984958;y_pot[2716]=0.984968;y_pot[2717]=0.984978;y_pot[2718]=0.984988;y_pot[2719]=0.984998;
+        y_pot[2720]=0.985007;y_pot[2721]=0.985017;y_pot[2722]=0.985027;y_pot[2723]=0.985037;y_pot[2724]=0.985047;
+        y_pot[2725]=0.985057;y_pot[2726]=0.985067;y_pot[2727]=0.985076;y_pot[2728]=0.985086;y_pot[2729]=0.985096;
+        y_pot[2730]=0.985106;y_pot[2731]=0.985116;y_pot[2732]=0.985125;y_pot[2733]=0.985135;y_pot[2734]=0.985145;
+        y_pot[2735]=0.985154;y_pot[2736]=0.985164;y_pot[2737]=0.985174;y_pot[2738]=0.985184;y_pot[2739]=0.985193;
+        y_pot[2740]=0.985203;y_pot[2741]=0.985212;y_pot[2742]=0.985222;y_pot[2743]=0.985232;y_pot[2744]=0.985241;
+        y_pot[2745]=0.985251;y_pot[2746]=0.98526;y_pot[2747]=0.98527;y_pot[2748]=0.985279;y_pot[2749]=0.985289;
+        y_pot[2750]=0.985298;y_pot[2751]=0.985308;y_pot[2752]=0.985317;y_pot[2753]=0.985327;y_pot[2754]=0.985336;
+        y_pot[2755]=0.985346;y_pot[2756]=0.985355;y_pot[2757]=0.985364;y_pot[2758]=0.985374;y_pot[2759]=0.985383;
+        y_pot[2760]=0.985393;y_pot[2761]=0.985402;y_pot[2762]=0.985411;y_pot[2763]=0.985421;y_pot[2764]=0.98543;
+        y_pot[2765]=0.985439;y_pot[2766]=0.985448;y_pot[2767]=0.985458;y_pot[2768]=0.985467;y_pot[2769]=0.985476;
+        y_pot[2770]=0.985485;y_pot[2771]=0.985495;y_pot[2772]=0.985504;y_pot[2773]=0.985513;y_pot[2774]=0.985522;
+        y_pot[2775]=0.985531;y_pot[2776]=0.98554;y_pot[2777]=0.98555;y_pot[2778]=0.985559;y_pot[2779]=0.985568;
+        y_pot[2780]=0.985577;y_pot[2781]=0.985586;y_pot[2782]=0.985595;y_pot[2783]=0.985604;y_pot[2784]=0.985613;
+        y_pot[2785]=0.985622;y_pot[2786]=0.985631;y_pot[2787]=0.98564;y_pot[2788]=0.985649;y_pot[2789]=0.985658;
+        y_pot[2790]=0.985667;y_pot[2791]=0.985676;y_pot[2792]=0.985685;y_pot[2793]=0.985694;y_pot[2794]=0.985703;
+        y_pot[2795]=0.985712;y_pot[2796]=0.985721;y_pot[2797]=0.98573;y_pot[2798]=0.985739;y_pot[2799]=0.985747;
+        y_pot[2800]=0.985756;y_pot[2801]=0.985765;y_pot[2802]=0.985774;y_pot[2803]=0.985783;y_pot[2804]=0.985792;
+        y_pot[2805]=0.9858;y_pot[2806]=0.985809;y_pot[2807]=0.985818;y_pot[2808]=0.985827;y_pot[2809]=0.985835;
+        y_pot[2810]=0.985844;y_pot[2811]=0.985853;y_pot[2812]=0.985862;y_pot[2813]=0.98587;y_pot[2814]=0.985879;
+        y_pot[2815]=0.985888;y_pot[2816]=0.985896;y_pot[2817]=0.985905;y_pot[2818]=0.985914;y_pot[2819]=0.985922;
+        y_pot[2820]=0.985931;y_pot[2821]=0.985939;y_pot[2822]=0.985948;y_pot[2823]=0.985957;y_pot[2824]=0.985965;
+        y_pot[2825]=0.985974;y_pot[2826]=0.985982;y_pot[2827]=0.985991;y_pot[2828]=0.985999;y_pot[2829]=0.986008;
+        y_pot[2830]=0.986016;y_pot[2831]=0.986025;y_pot[2832]=0.986033;y_pot[2833]=0.986042;y_pot[2834]=0.98605;
+        y_pot[2835]=0.986059;y_pot[2836]=0.986067;y_pot[2837]=0.986076;y_pot[2838]=0.986084;y_pot[2839]=0.986092;
+        y_pot[2840]=0.986101;y_pot[2841]=0.986109;y_pot[2842]=0.986117;y_pot[2843]=0.986126;y_pot[2844]=0.986134;
+        y_pot[2845]=0.986142;y_pot[2846]=0.986151;y_pot[2847]=0.986159;y_pot[2848]=0.986167;y_pot[2849]=0.986176;
+        y_pot[2850]=0.986184;y_pot[2851]=0.986192;y_pot[2852]=0.9862;y_pot[2853]=0.986209;y_pot[2854]=0.986217;
+        y_pot[2855]=0.986225;y_pot[2856]=0.986233;y_pot[2857]=0.986242;y_pot[2858]=0.98625;y_pot[2859]=0.986258;
+        y_pot[2860]=0.986266;y_pot[2861]=0.986274;y_pot[2862]=0.986282;y_pot[2863]=0.986291;y_pot[2864]=0.986299;
+        y_pot[2865]=0.986307;y_pot[2866]=0.986315;y_pot[2867]=0.986323;y_pot[2868]=0.986331;y_pot[2869]=0.986339;
+        y_pot[2870]=0.986347;y_pot[2871]=0.986355;y_pot[2872]=0.986363;y_pot[2873]=0.986371;y_pot[2874]=0.986379;
+        y_pot[2875]=0.986387;y_pot[2876]=0.986395;y_pot[2877]=0.986403;y_pot[2878]=0.986411;y_pot[2879]=0.986419;
+        y_pot[2880]=0.986427;y_pot[2881]=0.986435;y_pot[2882]=0.986443;y_pot[2883]=0.986451;y_pot[2884]=0.986459;
+        y_pot[2885]=0.986467;y_pot[2886]=0.986475;y_pot[2887]=0.986483;y_pot[2888]=0.986491;y_pot[2889]=0.986499;
+        y_pot[2890]=0.986506;y_pot[2891]=0.986514;y_pot[2892]=0.986522;y_pot[2893]=0.98653;y_pot[2894]=0.986538;
+        y_pot[2895]=0.986546;y_pot[2896]=0.986553;y_pot[2897]=0.986561;y_pot[2898]=0.986569;y_pot[2899]=0.986577;
+        y_pot[2900]=0.986584;y_pot[2901]=0.986592;y_pot[2902]=0.9866;y_pot[2903]=0.986608;y_pot[2904]=0.986615;
+        y_pot[2905]=0.986623;y_pot[2906]=0.986631;y_pot[2907]=0.986638;y_pot[2908]=0.986646;y_pot[2909]=0.986654;
+        y_pot[2910]=0.986661;y_pot[2911]=0.986669;y_pot[2912]=0.986677;y_pot[2913]=0.986684;y_pot[2914]=0.986692;
+        y_pot[2915]=0.9867;y_pot[2916]=0.986707;y_pot[2917]=0.986715;y_pot[2918]=0.986722;y_pot[2919]=0.98673;
+        y_pot[2920]=0.986738;y_pot[2921]=0.986745;y_pot[2922]=0.986753;y_pot[2923]=0.98676;y_pot[2924]=0.986768;
+        y_pot[2925]=0.986775;y_pot[2926]=0.986783;y_pot[2927]=0.98679;y_pot[2928]=0.986798;y_pot[2929]=0.986805;
+        y_pot[2930]=0.986813;y_pot[2931]=0.98682;y_pot[2932]=0.986828;y_pot[2933]=0.986835;y_pot[2934]=0.986843;
+        y_pot[2935]=0.98685;y_pot[2936]=0.986857;y_pot[2937]=0.986865;y_pot[2938]=0.986872;y_pot[2939]=0.98688;
+        y_pot[2940]=0.986887;y_pot[2941]=0.986894;y_pot[2942]=0.986902;y_pot[2943]=0.986909;y_pot[2944]=0.986916;
+        y_pot[2945]=0.986924;y_pot[2946]=0.986931;y_pot[2947]=0.986938;y_pot[2948]=0.986946;y_pot[2949]=0.986953;
+        y_pot[2950]=0.98696;y_pot[2951]=0.986968;y_pot[2952]=0.986975;y_pot[2953]=0.986982;y_pot[2954]=0.986989;
+        y_pot[2955]=0.986997;y_pot[2956]=0.987004;y_pot[2957]=0.987011;y_pot[2958]=0.987018;y_pot[2959]=0.987026;
+        y_pot[2960]=0.987033;y_pot[2961]=0.98704;y_pot[2962]=0.987047;y_pot[2963]=0.987054;y_pot[2964]=0.987062;
+        y_pot[2965]=0.987069;y_pot[2966]=0.987076;y_pot[2967]=0.987083;y_pot[2968]=0.98709;y_pot[2969]=0.987097;
+        y_pot[2970]=0.987104;y_pot[2971]=0.987112;y_pot[2972]=0.987119;y_pot[2973]=0.987126;y_pot[2974]=0.987133;
+        y_pot[2975]=0.98714;y_pot[2976]=0.987147;y_pot[2977]=0.987154;y_pot[2978]=0.987161;y_pot[2979]=0.987168;
+        y_pot[2980]=0.987175;y_pot[2981]=0.987182;y_pot[2982]=0.987189;y_pot[2983]=0.987196;y_pot[2984]=0.987203;
+        y_pot[2985]=0.98721;y_pot[2986]=0.987217;y_pot[2987]=0.987224;y_pot[2988]=0.987231;y_pot[2989]=0.987238;
+        y_pot[2990]=0.987245;y_pot[2991]=0.987252;y_pot[2992]=0.987259;y_pot[2993]=0.987266;y_pot[2994]=0.987273;
+        y_pot[2995]=0.98728;y_pot[2996]=0.987287;y_pot[2997]=0.987294;y_pot[2998]=0.9873;y_pot[2999]=0.987307;
+        y_pot[3000]=0.987314;y_pot[3001]=0.987321;y_pot[3002]=0.987328;y_pot[3003]=0.987335;y_pot[3004]=0.987342;
+        y_pot[3005]=0.987348;y_pot[3006]=0.987355;y_pot[3007]=0.987362;y_pot[3008]=0.987369;y_pot[3009]=0.987376;
+        y_pot[3010]=0.987382;y_pot[3011]=0.987389;y_pot[3012]=0.987396;y_pot[3013]=0.987403;y_pot[3014]=0.98741;
+        y_pot[3015]=0.987416;y_pot[3016]=0.987423;y_pot[3017]=0.98743;y_pot[3018]=0.987437;y_pot[3019]=0.987443;
+        y_pot[3020]=0.98745;y_pot[3021]=0.987457;y_pot[3022]=0.987463;y_pot[3023]=0.98747;y_pot[3024]=0.987477;
+        y_pot[3025]=0.987483;y_pot[3026]=0.98749;y_pot[3027]=0.987497;y_pot[3028]=0.987503;y_pot[3029]=0.98751;
+        y_pot[3030]=0.987517;y_pot[3031]=0.987523;y_pot[3032]=0.98753;y_pot[3033]=0.987537;y_pot[3034]=0.987543;
+        y_pot[3035]=0.98755;y_pot[3036]=0.987556;y_pot[3037]=0.987563;y_pot[3038]=0.987569;y_pot[3039]=0.987576;
+        y_pot[3040]=0.987583;y_pot[3041]=0.987589;y_pot[3042]=0.987596;y_pot[3043]=0.987602;y_pot[3044]=0.987609;
+        y_pot[3045]=0.987615;y_pot[3046]=0.987622;y_pot[3047]=0.987628;y_pot[3048]=0.987635;y_pot[3049]=0.987641;
+        y_pot[3050]=0.987648;y_pot[3051]=0.987654;y_pot[3052]=0.987661;y_pot[3053]=0.987667;y_pot[3054]=0.987674;
+        y_pot[3055]=0.98768;y_pot[3056]=0.987687;y_pot[3057]=0.987693;y_pot[3058]=0.987699;y_pot[3059]=0.987706;
+        y_pot[3060]=0.987712;y_pot[3061]=0.987719;y_pot[3062]=0.987725;y_pot[3063]=0.987732;y_pot[3064]=0.987738;
+        y_pot[3065]=0.987744;y_pot[3066]=0.987751;y_pot[3067]=0.987757;y_pot[3068]=0.987763;y_pot[3069]=0.98777;
+        y_pot[3070]=0.987776;y_pot[3071]=0.987782;y_pot[3072]=0.987789;y_pot[3073]=0.987795;y_pot[3074]=0.987801;
+        y_pot[3075]=0.987808;y_pot[3076]=0.987814;y_pot[3077]=0.98782;y_pot[3078]=0.987827;y_pot[3079]=0.987833;
+        y_pot[3080]=0.987839;y_pot[3081]=0.987845;y_pot[3082]=0.987852;y_pot[3083]=0.987858;y_pot[3084]=0.987864;
+        y_pot[3085]=0.98787;y_pot[3086]=0.987877;y_pot[3087]=0.987883;y_pot[3088]=0.987889;y_pot[3089]=0.987895;
+        y_pot[3090]=0.987901;y_pot[3091]=0.987908;y_pot[3092]=0.987914;y_pot[3093]=0.98792;y_pot[3094]=0.987926;
+        y_pot[3095]=0.987932;y_pot[3096]=0.987939;y_pot[3097]=0.987945;y_pot[3098]=0.987951;y_pot[3099]=0.987957;
+        y_pot[3100]=0.987963;y_pot[3101]=0.987969;y_pot[3102]=0.987975;y_pot[3103]=0.987981;y_pot[3104]=0.987988;
+        y_pot[3105]=0.987994;y_pot[3106]=0.988;y_pot[3107]=0.988006;y_pot[3108]=0.988012;y_pot[3109]=0.988018;
+        y_pot[3110]=0.988024;y_pot[3111]=0.98803;y_pot[3112]=0.988036;y_pot[3113]=0.988042;y_pot[3114]=0.988048;
+        y_pot[3115]=0.988054;y_pot[3116]=0.98806;y_pot[3117]=0.988066;y_pot[3118]=0.988072;y_pot[3119]=0.988078;
+        y_pot[3120]=0.988084;y_pot[3121]=0.98809;y_pot[3122]=0.988096;y_pot[3123]=0.988102;y_pot[3124]=0.988108;
+        y_pot[3125]=0.988114;y_pot[3126]=0.98812;y_pot[3127]=0.988126;y_pot[3128]=0.988132;y_pot[3129]=0.988138;
+        y_pot[3130]=0.988144;y_pot[3131]=0.98815;y_pot[3132]=0.988156;y_pot[3133]=0.988162;y_pot[3134]=0.988168;
+        y_pot[3135]=0.988174;y_pot[3136]=0.98818;y_pot[3137]=0.988186;y_pot[3138]=0.988191;y_pot[3139]=0.988197;
+        y_pot[3140]=0.988203;y_pot[3141]=0.988209;y_pot[3142]=0.988215;y_pot[3143]=0.988221;y_pot[3144]=0.988227;
+        y_pot[3145]=0.988232;y_pot[3146]=0.988238;y_pot[3147]=0.988244;y_pot[3148]=0.98825;y_pot[3149]=0.988256;
+        y_pot[3150]=0.988262;y_pot[3151]=0.988267;y_pot[3152]=0.988273;y_pot[3153]=0.988279;y_pot[3154]=0.988285;
+        y_pot[3155]=0.988291;y_pot[3156]=0.988296;y_pot[3157]=0.988302;y_pot[3158]=0.988308;y_pot[3159]=0.988314;
+        y_pot[3160]=0.988319;y_pot[3161]=0.988325;y_pot[3162]=0.988331;y_pot[3163]=0.988337;y_pot[3164]=0.988342;
+        y_pot[3165]=0.988348;y_pot[3166]=0.988354;y_pot[3167]=0.98836;y_pot[3168]=0.988365;y_pot[3169]=0.988371;
+        y_pot[3170]=0.988377;y_pot[3171]=0.988382;y_pot[3172]=0.988388;y_pot[3173]=0.988394;y_pot[3174]=0.988399;
+        y_pot[3175]=0.988405;y_pot[3176]=0.988411;y_pot[3177]=0.988416;y_pot[3178]=0.988422;y_pot[3179]=0.988428;
+        y_pot[3180]=0.988433;y_pot[3181]=0.988439;y_pot[3182]=0.988444;y_pot[3183]=0.98845;y_pot[3184]=0.988456;
+        y_pot[3185]=0.988461;y_pot[3186]=0.988467;y_pot[3187]=0.988473;y_pot[3188]=0.988478;y_pot[3189]=0.988484;
+        y_pot[3190]=0.988489;y_pot[3191]=0.988495;y_pot[3192]=0.9885;y_pot[3193]=0.988506;y_pot[3194]=0.988512;
+        y_pot[3195]=0.988517;y_pot[3196]=0.988523;y_pot[3197]=0.988528;y_pot[3198]=0.988534;y_pot[3199]=0.988539;
+        y_pot[3200]=0.988545;y_pot[3201]=0.98855;y_pot[3202]=0.988556;y_pot[3203]=0.988561;y_pot[3204]=0.988567;
+        y_pot[3205]=0.988572;y_pot[3206]=0.988578;y_pot[3207]=0.988583;y_pot[3208]=0.988589;y_pot[3209]=0.988594;
+        y_pot[3210]=0.9886;y_pot[3211]=0.988605;y_pot[3212]=0.98861;y_pot[3213]=0.988616;y_pot[3214]=0.988621;
+        y_pot[3215]=0.988627;y_pot[3216]=0.988632;y_pot[3217]=0.988638;y_pot[3218]=0.988643;y_pot[3219]=0.988649;
+        y_pot[3220]=0.988654;y_pot[3221]=0.988659;y_pot[3222]=0.988665;y_pot[3223]=0.98867;y_pot[3224]=0.988675;
+        y_pot[3225]=0.988681;y_pot[3226]=0.988686;y_pot[3227]=0.988692;y_pot[3228]=0.988697;y_pot[3229]=0.988702;
+        y_pot[3230]=0.988708;y_pot[3231]=0.988713;y_pot[3232]=0.988718;y_pot[3233]=0.988724;y_pot[3234]=0.988729;
+        y_pot[3235]=0.988734;y_pot[3236]=0.98874;y_pot[3237]=0.988745;y_pot[3238]=0.98875;y_pot[3239]=0.988756;
+        y_pot[3240]=0.988761;y_pot[3241]=0.988766;y_pot[3242]=0.988771;y_pot[3243]=0.988777;y_pot[3244]=0.988782;
+        y_pot[3245]=0.988787;y_pot[3246]=0.988793;y_pot[3247]=0.988798;y_pot[3248]=0.988803;y_pot[3249]=0.988808;
+        y_pot[3250]=0.988814;y_pot[3251]=0.988819;y_pot[3252]=0.988824;y_pot[3253]=0.988829;y_pot[3254]=0.988835;
+        y_pot[3255]=0.98884;y_pot[3256]=0.988845;y_pot[3257]=0.98885;y_pot[3258]=0.988855;y_pot[3259]=0.988861;
+        y_pot[3260]=0.988866;y_pot[3261]=0.988871;y_pot[3262]=0.988876;y_pot[3263]=0.988881;y_pot[3264]=0.988887;
+        y_pot[3265]=0.988892;y_pot[3266]=0.988897;y_pot[3267]=0.988902;y_pot[3268]=0.988907;y_pot[3269]=0.988912;
+        y_pot[3270]=0.988917;y_pot[3271]=0.988923;y_pot[3272]=0.988928;y_pot[3273]=0.988933;y_pot[3274]=0.988938;
+        y_pot[3275]=0.988943;y_pot[3276]=0.988948;y_pot[3277]=0.988953;y_pot[3278]=0.988958;y_pot[3279]=0.988964;
+        y_pot[3280]=0.988969;y_pot[3281]=0.988974;y_pot[3282]=0.988979;y_pot[3283]=0.988984;y_pot[3284]=0.988989;
+        y_pot[3285]=0.988994;y_pot[3286]=0.988999;y_pot[3287]=0.989004;y_pot[3288]=0.989009;y_pot[3289]=0.989014;
+        y_pot[3290]=0.989019;y_pot[3291]=0.989024;y_pot[3292]=0.989029;y_pot[3293]=0.989034;y_pot[3294]=0.989039;
+        y_pot[3295]=0.989044;y_pot[3296]=0.989049;y_pot[3297]=0.989054;y_pot[3298]=0.989059;y_pot[3299]=0.989064;
+        y_pot[3300]=0.989069;y_pot[3301]=0.989074;y_pot[3302]=0.989079;y_pot[3303]=0.989084;y_pot[3304]=0.989089;
+        y_pot[3305]=0.989094;y_pot[3306]=0.989099;y_pot[3307]=0.989104;y_pot[3308]=0.989109;y_pot[3309]=0.989114;
+        y_pot[3310]=0.989119;y_pot[3311]=0.989124;y_pot[3312]=0.989129;y_pot[3313]=0.989134;y_pot[3314]=0.989139;
+        y_pot[3315]=0.989144;y_pot[3316]=0.989149;y_pot[3317]=0.989154;y_pot[3318]=0.989159;y_pot[3319]=0.989163;
+        y_pot[3320]=0.989168;y_pot[3321]=0.989173;y_pot[3322]=0.989178;y_pot[3323]=0.989183;y_pot[3324]=0.989188;
+        y_pot[3325]=0.989193;y_pot[3326]=0.989198;y_pot[3327]=0.989202;y_pot[3328]=0.989207;y_pot[3329]=0.989212;
+        y_pot[3330]=0.989217;y_pot[3331]=0.989222;y_pot[3332]=0.989227;y_pot[3333]=0.989232;y_pot[3334]=0.989236;
+        y_pot[3335]=0.989241;y_pot[3336]=0.989246;y_pot[3337]=0.989251;y_pot[3338]=0.989256;y_pot[3339]=0.989261;
+        y_pot[3340]=0.989265;y_pot[3341]=0.98927;y_pot[3342]=0.989275;y_pot[3343]=0.98928;y_pot[3344]=0.989284;
+        y_pot[3345]=0.989289;y_pot[3346]=0.989294;y_pot[3347]=0.989299;y_pot[3348]=0.989304;y_pot[3349]=0.989308;
+        y_pot[3350]=0.989313;y_pot[3351]=0.989318;y_pot[3352]=0.989323;y_pot[3353]=0.989327;y_pot[3354]=0.989332;
+        y_pot[3355]=0.989337;y_pot[3356]=0.989342;y_pot[3357]=0.989346;y_pot[3358]=0.989351;y_pot[3359]=0.989356;
+        y_pot[3360]=0.98936;y_pot[3361]=0.989365;y_pot[3362]=0.98937;y_pot[3363]=0.989375;y_pot[3364]=0.989379;
+        y_pot[3365]=0.989384;y_pot[3366]=0.989389;y_pot[3367]=0.989393;y_pot[3368]=0.989398;y_pot[3369]=0.989403;
+        y_pot[3370]=0.989407;y_pot[3371]=0.989412;y_pot[3372]=0.989417;y_pot[3373]=0.989421;y_pot[3374]=0.989426;
+        y_pot[3375]=0.989431;y_pot[3376]=0.989435;y_pot[3377]=0.98944;y_pot[3378]=0.989445;y_pot[3379]=0.989449;
+        y_pot[3380]=0.989454;y_pot[3381]=0.989459;y_pot[3382]=0.989463;y_pot[3383]=0.989468;y_pot[3384]=0.989472;
+        y_pot[3385]=0.989477;y_pot[3386]=0.989482;y_pot[3387]=0.989486;y_pot[3388]=0.989491;y_pot[3389]=0.989495;
+        y_pot[3390]=0.9895;y_pot[3391]=0.989505;y_pot[3392]=0.989509;y_pot[3393]=0.989514;y_pot[3394]=0.989518;
+        y_pot[3395]=0.989523;y_pot[3396]=0.989527;y_pot[3397]=0.989532;y_pot[3398]=0.989537;y_pot[3399]=0.989541;
+        y_pot[3400]=0.989546;
+
+        // Table: f22_dep_map.pwl (3401 points)
+        y_dep[0]=0.006722;y_dep[1]=0.006725;y_dep[2]=0.006728;y_dep[3]=0.006731;y_dep[4]=0.006734;
+        y_dep[5]=0.006737;y_dep[6]=0.00674;y_dep[7]=0.006743;y_dep[8]=0.006746;y_dep[9]=0.006749;
+        y_dep[10]=0.006752;y_dep[11]=0.006755;y_dep[12]=0.006758;y_dep[13]=0.006761;y_dep[14]=0.006764;
+        y_dep[15]=0.006767;y_dep[16]=0.00677;y_dep[17]=0.006774;y_dep[18]=0.006777;y_dep[19]=0.00678;
+        y_dep[20]=0.006783;y_dep[21]=0.006786;y_dep[22]=0.006789;y_dep[23]=0.006792;y_dep[24]=0.006795;
+        y_dep[25]=0.006798;y_dep[26]=0.006801;y_dep[27]=0.006804;y_dep[28]=0.006808;y_dep[29]=0.006811;
+        y_dep[30]=0.006814;y_dep[31]=0.006817;y_dep[32]=0.00682;y_dep[33]=0.006823;y_dep[34]=0.006826;
+        y_dep[35]=0.006829;y_dep[36]=0.006833;y_dep[37]=0.006836;y_dep[38]=0.006839;y_dep[39]=0.006842;
+        y_dep[40]=0.006845;y_dep[41]=0.006848;y_dep[42]=0.006851;y_dep[43]=0.006855;y_dep[44]=0.006858;
+        y_dep[45]=0.006861;y_dep[46]=0.006864;y_dep[47]=0.006867;y_dep[48]=0.00687;y_dep[49]=0.006874;
+        y_dep[50]=0.006877;y_dep[51]=0.00688;y_dep[52]=0.006883;y_dep[53]=0.006886;y_dep[54]=0.006889;
+        y_dep[55]=0.006893;y_dep[56]=0.006896;y_dep[57]=0.006899;y_dep[58]=0.006902;y_dep[59]=0.006905;
+        y_dep[60]=0.006909;y_dep[61]=0.006912;y_dep[62]=0.006915;y_dep[63]=0.006918;y_dep[64]=0.006922;
+        y_dep[65]=0.006925;y_dep[66]=0.006928;y_dep[67]=0.006931;y_dep[68]=0.006934;y_dep[69]=0.006938;
+        y_dep[70]=0.006941;y_dep[71]=0.006944;y_dep[72]=0.006947;y_dep[73]=0.006951;y_dep[74]=0.006954;
+        y_dep[75]=0.006957;y_dep[76]=0.00696;y_dep[77]=0.006964;y_dep[78]=0.006967;y_dep[79]=0.00697;
+        y_dep[80]=0.006973;y_dep[81]=0.006977;y_dep[82]=0.00698;y_dep[83]=0.006983;y_dep[84]=0.006987;
+        y_dep[85]=0.00699;y_dep[86]=0.006993;y_dep[87]=0.006996;y_dep[88]=0.007;y_dep[89]=0.007003;
+        y_dep[90]=0.007006;y_dep[91]=0.00701;y_dep[92]=0.007013;y_dep[93]=0.007016;y_dep[94]=0.00702;
+        y_dep[95]=0.007023;y_dep[96]=0.007026;y_dep[97]=0.00703;y_dep[98]=0.007033;y_dep[99]=0.007036;
+        y_dep[100]=0.00704;y_dep[101]=0.007043;y_dep[102]=0.007046;y_dep[103]=0.00705;y_dep[104]=0.007053;
+        y_dep[105]=0.007056;y_dep[106]=0.00706;y_dep[107]=0.007063;y_dep[108]=0.007066;y_dep[109]=0.00707;
+        y_dep[110]=0.007073;y_dep[111]=0.007077;y_dep[112]=0.00708;y_dep[113]=0.007083;y_dep[114]=0.007087;
+        y_dep[115]=0.00709;y_dep[116]=0.007094;y_dep[117]=0.007097;y_dep[118]=0.0071;y_dep[119]=0.007104;
+        y_dep[120]=0.007107;y_dep[121]=0.007111;y_dep[122]=0.007114;y_dep[123]=0.007117;y_dep[124]=0.007121;
+        y_dep[125]=0.007124;y_dep[126]=0.007128;y_dep[127]=0.007131;y_dep[128]=0.007135;y_dep[129]=0.007138;
+        y_dep[130]=0.007141;y_dep[131]=0.007145;y_dep[132]=0.007148;y_dep[133]=0.007152;y_dep[134]=0.007155;
+        y_dep[135]=0.007159;y_dep[136]=0.007162;y_dep[137]=0.007166;y_dep[138]=0.007169;y_dep[139]=0.007173;
+        y_dep[140]=0.007176;y_dep[141]=0.00718;y_dep[142]=0.007183;y_dep[143]=0.007187;y_dep[144]=0.00719;
+        y_dep[145]=0.007194;y_dep[146]=0.007197;y_dep[147]=0.007201;y_dep[148]=0.007204;y_dep[149]=0.007208;
+        y_dep[150]=0.007211;y_dep[151]=0.007215;y_dep[152]=0.007218;y_dep[153]=0.007222;y_dep[154]=0.007225;
+        y_dep[155]=0.007229;y_dep[156]=0.007232;y_dep[157]=0.007236;y_dep[158]=0.007239;y_dep[159]=0.007243;
+        y_dep[160]=0.007246;y_dep[161]=0.00725;y_dep[162]=0.007254;y_dep[163]=0.007257;y_dep[164]=0.007261;
+        y_dep[165]=0.007264;y_dep[166]=0.007268;y_dep[167]=0.007271;y_dep[168]=0.007275;y_dep[169]=0.007279;
+        y_dep[170]=0.007282;y_dep[171]=0.007286;y_dep[172]=0.007289;y_dep[173]=0.007293;y_dep[174]=0.007297;
+        y_dep[175]=0.0073;y_dep[176]=0.007304;y_dep[177]=0.007307;y_dep[178]=0.007311;y_dep[179]=0.007315;
+        y_dep[180]=0.007318;y_dep[181]=0.007322;y_dep[182]=0.007326;y_dep[183]=0.007329;y_dep[184]=0.007333;
+        y_dep[185]=0.007336;y_dep[186]=0.00734;y_dep[187]=0.007344;y_dep[188]=0.007347;y_dep[189]=0.007351;
+        y_dep[190]=0.007355;y_dep[191]=0.007358;y_dep[192]=0.007362;y_dep[193]=0.007366;y_dep[194]=0.00737;
+        y_dep[195]=0.007373;y_dep[196]=0.007377;y_dep[197]=0.007381;y_dep[198]=0.007384;y_dep[199]=0.007388;
+        y_dep[200]=0.007392;y_dep[201]=0.007395;y_dep[202]=0.007399;y_dep[203]=0.007403;y_dep[204]=0.007407;
+        y_dep[205]=0.00741;y_dep[206]=0.007414;y_dep[207]=0.007418;y_dep[208]=0.007422;y_dep[209]=0.007425;
+        y_dep[210]=0.007429;y_dep[211]=0.007433;y_dep[212]=0.007437;y_dep[213]=0.00744;y_dep[214]=0.007444;
+        y_dep[215]=0.007448;y_dep[216]=0.007452;y_dep[217]=0.007455;y_dep[218]=0.007459;y_dep[219]=0.007463;
+        y_dep[220]=0.007467;y_dep[221]=0.00747;y_dep[222]=0.007474;y_dep[223]=0.007478;y_dep[224]=0.007482;
+        y_dep[225]=0.007486;y_dep[226]=0.00749;y_dep[227]=0.007493;y_dep[228]=0.007497;y_dep[229]=0.007501;
+        y_dep[230]=0.007505;y_dep[231]=0.007509;y_dep[232]=0.007513;y_dep[233]=0.007516;y_dep[234]=0.00752;
+        y_dep[235]=0.007524;y_dep[236]=0.007528;y_dep[237]=0.007532;y_dep[238]=0.007536;y_dep[239]=0.00754;
+        y_dep[240]=0.007543;y_dep[241]=0.007547;y_dep[242]=0.007551;y_dep[243]=0.007555;y_dep[244]=0.007559;
+        y_dep[245]=0.007563;y_dep[246]=0.007567;y_dep[247]=0.007571;y_dep[248]=0.007575;y_dep[249]=0.007578;
+        y_dep[250]=0.007582;y_dep[251]=0.007586;y_dep[252]=0.00759;y_dep[253]=0.007594;y_dep[254]=0.007598;
+        y_dep[255]=0.007602;y_dep[256]=0.007606;y_dep[257]=0.00761;y_dep[258]=0.007614;y_dep[259]=0.007618;
+        y_dep[260]=0.007622;y_dep[261]=0.007626;y_dep[262]=0.00763;y_dep[263]=0.007634;y_dep[264]=0.007638;
+        y_dep[265]=0.007642;y_dep[266]=0.007646;y_dep[267]=0.00765;y_dep[268]=0.007654;y_dep[269]=0.007658;
+        y_dep[270]=0.007662;y_dep[271]=0.007666;y_dep[272]=0.00767;y_dep[273]=0.007674;y_dep[274]=0.007678;
+        y_dep[275]=0.007682;y_dep[276]=0.007686;y_dep[277]=0.00769;y_dep[278]=0.007694;y_dep[279]=0.007698;
+        y_dep[280]=0.007702;y_dep[281]=0.007706;y_dep[282]=0.00771;y_dep[283]=0.007714;y_dep[284]=0.007718;
+        y_dep[285]=0.007722;y_dep[286]=0.007726;y_dep[287]=0.00773;y_dep[288]=0.007735;y_dep[289]=0.007739;
+        y_dep[290]=0.007743;y_dep[291]=0.007747;y_dep[292]=0.007751;y_dep[293]=0.007755;y_dep[294]=0.007759;
+        y_dep[295]=0.007763;y_dep[296]=0.007767;y_dep[297]=0.007772;y_dep[298]=0.007776;y_dep[299]=0.00778;
+        y_dep[300]=0.007784;y_dep[301]=0.007788;y_dep[302]=0.007792;y_dep[303]=0.007796;y_dep[304]=0.007801;
+        y_dep[305]=0.007805;y_dep[306]=0.007809;y_dep[307]=0.007813;y_dep[308]=0.007817;y_dep[309]=0.007822;
+        y_dep[310]=0.007826;y_dep[311]=0.00783;y_dep[312]=0.007834;y_dep[313]=0.007838;y_dep[314]=0.007843;
+        y_dep[315]=0.007847;y_dep[316]=0.007851;y_dep[317]=0.007855;y_dep[318]=0.007859;y_dep[319]=0.007864;
+        y_dep[320]=0.007868;y_dep[321]=0.007872;y_dep[322]=0.007876;y_dep[323]=0.007881;y_dep[324]=0.007885;
+        y_dep[325]=0.007889;y_dep[326]=0.007894;y_dep[327]=0.007898;y_dep[328]=0.007902;y_dep[329]=0.007906;
+        y_dep[330]=0.007911;y_dep[331]=0.007915;y_dep[332]=0.007919;y_dep[333]=0.007924;y_dep[334]=0.007928;
+        y_dep[335]=0.007932;y_dep[336]=0.007937;y_dep[337]=0.007941;y_dep[338]=0.007945;y_dep[339]=0.00795;
+        y_dep[340]=0.007954;y_dep[341]=0.007958;y_dep[342]=0.007963;y_dep[343]=0.007967;y_dep[344]=0.007971;
+        y_dep[345]=0.007976;y_dep[346]=0.00798;y_dep[347]=0.007984;y_dep[348]=0.007989;y_dep[349]=0.007993;
+        y_dep[350]=0.007998;y_dep[351]=0.008002;y_dep[352]=0.008006;y_dep[353]=0.008011;y_dep[354]=0.008015;
+        y_dep[355]=0.00802;y_dep[356]=0.008024;y_dep[357]=0.008029;y_dep[358]=0.008033;y_dep[359]=0.008037;
+        y_dep[360]=0.008042;y_dep[361]=0.008046;y_dep[362]=0.008051;y_dep[363]=0.008055;y_dep[364]=0.00806;
+        y_dep[365]=0.008064;y_dep[366]=0.008069;y_dep[367]=0.008073;y_dep[368]=0.008078;y_dep[369]=0.008082;
+        y_dep[370]=0.008087;y_dep[371]=0.008091;y_dep[372]=0.008096;y_dep[373]=0.0081;y_dep[374]=0.008105;
+        y_dep[375]=0.008109;y_dep[376]=0.008114;y_dep[377]=0.008118;y_dep[378]=0.008123;y_dep[379]=0.008128;
+        y_dep[380]=0.008132;y_dep[381]=0.008137;y_dep[382]=0.008141;y_dep[383]=0.008146;y_dep[384]=0.00815;
+        y_dep[385]=0.008155;y_dep[386]=0.00816;y_dep[387]=0.008164;y_dep[388]=0.008169;y_dep[389]=0.008173;
+        y_dep[390]=0.008178;y_dep[391]=0.008183;y_dep[392]=0.008187;y_dep[393]=0.008192;y_dep[394]=0.008197;
+        y_dep[395]=0.008201;y_dep[396]=0.008206;y_dep[397]=0.00821;y_dep[398]=0.008215;y_dep[399]=0.00822;
+        y_dep[400]=0.008224;y_dep[401]=0.008229;y_dep[402]=0.008234;y_dep[403]=0.008239;y_dep[404]=0.008243;
+        y_dep[405]=0.008248;y_dep[406]=0.008253;y_dep[407]=0.008257;y_dep[408]=0.008262;y_dep[409]=0.008267;
+        y_dep[410]=0.008272;y_dep[411]=0.008276;y_dep[412]=0.008281;y_dep[413]=0.008286;y_dep[414]=0.008291;
+        y_dep[415]=0.008295;y_dep[416]=0.0083;y_dep[417]=0.008305;y_dep[418]=0.00831;y_dep[419]=0.008314;
+        y_dep[420]=0.008319;y_dep[421]=0.008324;y_dep[422]=0.008329;y_dep[423]=0.008334;y_dep[424]=0.008338;
+        y_dep[425]=0.008343;y_dep[426]=0.008348;y_dep[427]=0.008353;y_dep[428]=0.008358;y_dep[429]=0.008363;
+        y_dep[430]=0.008367;y_dep[431]=0.008372;y_dep[432]=0.008377;y_dep[433]=0.008382;y_dep[434]=0.008387;
+        y_dep[435]=0.008392;y_dep[436]=0.008397;y_dep[437]=0.008402;y_dep[438]=0.008407;y_dep[439]=0.008411;
+        y_dep[440]=0.008416;y_dep[441]=0.008421;y_dep[442]=0.008426;y_dep[443]=0.008431;y_dep[444]=0.008436;
+        y_dep[445]=0.008441;y_dep[446]=0.008446;y_dep[447]=0.008451;y_dep[448]=0.008456;y_dep[449]=0.008461;
+        y_dep[450]=0.008466;y_dep[451]=0.008471;y_dep[452]=0.008476;y_dep[453]=0.008481;y_dep[454]=0.008486;
+        y_dep[455]=0.008491;y_dep[456]=0.008496;y_dep[457]=0.008501;y_dep[458]=0.008506;y_dep[459]=0.008511;
+        y_dep[460]=0.008516;y_dep[461]=0.008521;y_dep[462]=0.008526;y_dep[463]=0.008531;y_dep[464]=0.008536;
+        y_dep[465]=0.008541;y_dep[466]=0.008546;y_dep[467]=0.008552;y_dep[468]=0.008557;y_dep[469]=0.008562;
+        y_dep[470]=0.008567;y_dep[471]=0.008572;y_dep[472]=0.008577;y_dep[473]=0.008582;y_dep[474]=0.008587;
+        y_dep[475]=0.008593;y_dep[476]=0.008598;y_dep[477]=0.008603;y_dep[478]=0.008608;y_dep[479]=0.008613;
+        y_dep[480]=0.008618;y_dep[481]=0.008624;y_dep[482]=0.008629;y_dep[483]=0.008634;y_dep[484]=0.008639;
+        y_dep[485]=0.008644;y_dep[486]=0.00865;y_dep[487]=0.008655;y_dep[488]=0.00866;y_dep[489]=0.008665;
+        y_dep[490]=0.008671;y_dep[491]=0.008676;y_dep[492]=0.008681;y_dep[493]=0.008686;y_dep[494]=0.008692;
+        y_dep[495]=0.008697;y_dep[496]=0.008702;y_dep[497]=0.008708;y_dep[498]=0.008713;y_dep[499]=0.008718;
+        y_dep[500]=0.008723;y_dep[501]=0.008729;y_dep[502]=0.008734;y_dep[503]=0.008739;y_dep[504]=0.008745;
+        y_dep[505]=0.00875;y_dep[506]=0.008756;y_dep[507]=0.008761;y_dep[508]=0.008766;y_dep[509]=0.008772;
+        y_dep[510]=0.008777;y_dep[511]=0.008783;y_dep[512]=0.008788;y_dep[513]=0.008793;y_dep[514]=0.008799;
+        y_dep[515]=0.008804;y_dep[516]=0.00881;y_dep[517]=0.008815;y_dep[518]=0.008821;y_dep[519]=0.008826;
+        y_dep[520]=0.008831;y_dep[521]=0.008837;y_dep[522]=0.008842;y_dep[523]=0.008848;y_dep[524]=0.008853;
+        y_dep[525]=0.008859;y_dep[526]=0.008864;y_dep[527]=0.00887;y_dep[528]=0.008875;y_dep[529]=0.008881;
+        y_dep[530]=0.008887;y_dep[531]=0.008892;y_dep[532]=0.008898;y_dep[533]=0.008903;y_dep[534]=0.008909;
+        y_dep[535]=0.008914;y_dep[536]=0.00892;y_dep[537]=0.008926;y_dep[538]=0.008931;y_dep[539]=0.008937;
+        y_dep[540]=0.008942;y_dep[541]=0.008948;y_dep[542]=0.008954;y_dep[543]=0.008959;y_dep[544]=0.008965;
+        y_dep[545]=0.008971;y_dep[546]=0.008976;y_dep[547]=0.008982;y_dep[548]=0.008988;y_dep[549]=0.008993;
+        y_dep[550]=0.008999;y_dep[551]=0.009005;y_dep[552]=0.009011;y_dep[553]=0.009016;y_dep[554]=0.009022;
+        y_dep[555]=0.009028;y_dep[556]=0.009033;y_dep[557]=0.009039;y_dep[558]=0.009045;y_dep[559]=0.009051;
+        y_dep[560]=0.009057;y_dep[561]=0.009062;y_dep[562]=0.009068;y_dep[563]=0.009074;y_dep[564]=0.00908;
+        y_dep[565]=0.009086;y_dep[566]=0.009091;y_dep[567]=0.009097;y_dep[568]=0.009103;y_dep[569]=0.009109;
+        y_dep[570]=0.009115;y_dep[571]=0.009121;y_dep[572]=0.009127;y_dep[573]=0.009132;y_dep[574]=0.009138;
+        y_dep[575]=0.009144;y_dep[576]=0.00915;y_dep[577]=0.009156;y_dep[578]=0.009162;y_dep[579]=0.009168;
+        y_dep[580]=0.009174;y_dep[581]=0.00918;y_dep[582]=0.009186;y_dep[583]=0.009192;y_dep[584]=0.009198;
+        y_dep[585]=0.009204;y_dep[586]=0.00921;y_dep[587]=0.009216;y_dep[588]=0.009222;y_dep[589]=0.009228;
+        y_dep[590]=0.009234;y_dep[591]=0.00924;y_dep[592]=0.009246;y_dep[593]=0.009252;y_dep[594]=0.009258;
+        y_dep[595]=0.009264;y_dep[596]=0.00927;y_dep[597]=0.009276;y_dep[598]=0.009283;y_dep[599]=0.009289;
+        y_dep[600]=0.009295;y_dep[601]=0.009301;y_dep[602]=0.009307;y_dep[603]=0.009313;y_dep[604]=0.009319;
+        y_dep[605]=0.009326;y_dep[606]=0.009332;y_dep[607]=0.009338;y_dep[608]=0.009344;y_dep[609]=0.00935;
+        y_dep[610]=0.009357;y_dep[611]=0.009363;y_dep[612]=0.009369;y_dep[613]=0.009375;y_dep[614]=0.009382;
+        y_dep[615]=0.009388;y_dep[616]=0.009394;y_dep[617]=0.0094;y_dep[618]=0.009407;y_dep[619]=0.009413;
+        y_dep[620]=0.009419;y_dep[621]=0.009426;y_dep[622]=0.009432;y_dep[623]=0.009438;y_dep[624]=0.009445;
+        y_dep[625]=0.009451;y_dep[626]=0.009457;y_dep[627]=0.009464;y_dep[628]=0.00947;y_dep[629]=0.009477;
+        y_dep[630]=0.009483;y_dep[631]=0.009489;y_dep[632]=0.009496;y_dep[633]=0.009502;y_dep[634]=0.009509;
+        y_dep[635]=0.009515;y_dep[636]=0.009522;y_dep[637]=0.009528;y_dep[638]=0.009535;y_dep[639]=0.009541;
+        y_dep[640]=0.009548;y_dep[641]=0.009554;y_dep[642]=0.009561;y_dep[643]=0.009567;y_dep[644]=0.009574;
+        y_dep[645]=0.00958;y_dep[646]=0.009587;y_dep[647]=0.009593;y_dep[648]=0.0096;y_dep[649]=0.009607;
+        y_dep[650]=0.009613;y_dep[651]=0.00962;y_dep[652]=0.009627;y_dep[653]=0.009633;y_dep[654]=0.00964;
+        y_dep[655]=0.009647;y_dep[656]=0.009653;y_dep[657]=0.00966;y_dep[658]=0.009667;y_dep[659]=0.009673;
+        y_dep[660]=0.00968;y_dep[661]=0.009687;y_dep[662]=0.009693;y_dep[663]=0.0097;y_dep[664]=0.009707;
+        y_dep[665]=0.009714;y_dep[666]=0.00972;y_dep[667]=0.009727;y_dep[668]=0.009734;y_dep[669]=0.009741;
+        y_dep[670]=0.009748;y_dep[671]=0.009755;y_dep[672]=0.009761;y_dep[673]=0.009768;y_dep[674]=0.009775;
+        y_dep[675]=0.009782;y_dep[676]=0.009789;y_dep[677]=0.009796;y_dep[678]=0.009803;y_dep[679]=0.00981;
+        y_dep[680]=0.009817;y_dep[681]=0.009823;y_dep[682]=0.00983;y_dep[683]=0.009837;y_dep[684]=0.009844;
+        y_dep[685]=0.009851;y_dep[686]=0.009858;y_dep[687]=0.009865;y_dep[688]=0.009872;y_dep[689]=0.009879;
+        y_dep[690]=0.009886;y_dep[691]=0.009893;y_dep[692]=0.009901;y_dep[693]=0.009908;y_dep[694]=0.009915;
+        y_dep[695]=0.009922;y_dep[696]=0.009929;y_dep[697]=0.009936;y_dep[698]=0.009943;y_dep[699]=0.00995;
+        y_dep[700]=0.009957;y_dep[701]=0.009965;y_dep[702]=0.009972;y_dep[703]=0.009979;y_dep[704]=0.009986;
+        y_dep[705]=0.009993;y_dep[706]=0.010001;y_dep[707]=0.010008;y_dep[708]=0.010015;y_dep[709]=0.010022;
+        y_dep[710]=0.01003;y_dep[711]=0.010037;y_dep[712]=0.010044;y_dep[713]=0.010052;y_dep[714]=0.010059;
+        y_dep[715]=0.010066;y_dep[716]=0.010074;y_dep[717]=0.010081;y_dep[718]=0.010088;y_dep[719]=0.010096;
+        y_dep[720]=0.010103;y_dep[721]=0.010111;y_dep[722]=0.010118;y_dep[723]=0.010125;y_dep[724]=0.010133;
+        y_dep[725]=0.01014;y_dep[726]=0.010148;y_dep[727]=0.010155;y_dep[728]=0.010163;y_dep[729]=0.01017;
+        y_dep[730]=0.010178;y_dep[731]=0.010185;y_dep[732]=0.010193;y_dep[733]=0.0102;y_dep[734]=0.010208;
+        y_dep[735]=0.010216;y_dep[736]=0.010223;y_dep[737]=0.010231;y_dep[738]=0.010238;y_dep[739]=0.010246;
+        y_dep[740]=0.010254;y_dep[741]=0.010261;y_dep[742]=0.010269;y_dep[743]=0.010277;y_dep[744]=0.010285;
+        y_dep[745]=0.010292;y_dep[746]=0.0103;y_dep[747]=0.010308;y_dep[748]=0.010315;y_dep[749]=0.010323;
+        y_dep[750]=0.010331;y_dep[751]=0.010339;y_dep[752]=0.010347;y_dep[753]=0.010354;y_dep[754]=0.010362;
+        y_dep[755]=0.01037;y_dep[756]=0.010378;y_dep[757]=0.010386;y_dep[758]=0.010394;y_dep[759]=0.010402;
+        y_dep[760]=0.01041;y_dep[761]=0.010418;y_dep[762]=0.010426;y_dep[763]=0.010433;y_dep[764]=0.010441;
+        y_dep[765]=0.010449;y_dep[766]=0.010457;y_dep[767]=0.010465;y_dep[768]=0.010474;y_dep[769]=0.010482;
+        y_dep[770]=0.01049;y_dep[771]=0.010498;y_dep[772]=0.010506;y_dep[773]=0.010514;y_dep[774]=0.010522;
+        y_dep[775]=0.01053;y_dep[776]=0.010538;y_dep[777]=0.010546;y_dep[778]=0.010555;y_dep[779]=0.010563;
+        y_dep[780]=0.010571;y_dep[781]=0.010579;y_dep[782]=0.010588;y_dep[783]=0.010596;y_dep[784]=0.010604;
+        y_dep[785]=0.010612;y_dep[786]=0.010621;y_dep[787]=0.010629;y_dep[788]=0.010637;y_dep[789]=0.010646;
+        y_dep[790]=0.010654;y_dep[791]=0.010662;y_dep[792]=0.010671;y_dep[793]=0.010679;y_dep[794]=0.010688;
+        y_dep[795]=0.010696;y_dep[796]=0.010704;y_dep[797]=0.010713;y_dep[798]=0.010721;y_dep[799]=0.01073;
+        y_dep[800]=0.010738;y_dep[801]=0.010747;y_dep[802]=0.010755;y_dep[803]=0.010764;y_dep[804]=0.010773;
+        y_dep[805]=0.010781;y_dep[806]=0.01079;y_dep[807]=0.010798;y_dep[808]=0.010807;y_dep[809]=0.010816;
+        y_dep[810]=0.010824;y_dep[811]=0.010833;y_dep[812]=0.010842;y_dep[813]=0.01085;y_dep[814]=0.010859;
+        y_dep[815]=0.010868;y_dep[816]=0.010877;y_dep[817]=0.010886;y_dep[818]=0.010894;y_dep[819]=0.010903;
+        y_dep[820]=0.010912;y_dep[821]=0.010921;y_dep[822]=0.01093;y_dep[823]=0.010939;y_dep[824]=0.010947;
+        y_dep[825]=0.010956;y_dep[826]=0.010965;y_dep[827]=0.010974;y_dep[828]=0.010983;y_dep[829]=0.010992;
+        y_dep[830]=0.011001;y_dep[831]=0.01101;y_dep[832]=0.011019;y_dep[833]=0.011028;y_dep[834]=0.011037;
+        y_dep[835]=0.011047;y_dep[836]=0.011056;y_dep[837]=0.011065;y_dep[838]=0.011074;y_dep[839]=0.011083;
+        y_dep[840]=0.011092;y_dep[841]=0.011101;y_dep[842]=0.011111;y_dep[843]=0.01112;y_dep[844]=0.011129;
+        y_dep[845]=0.011138;y_dep[846]=0.011148;y_dep[847]=0.011157;y_dep[848]=0.011166;y_dep[849]=0.011176;
+        y_dep[850]=0.011185;y_dep[851]=0.011194;y_dep[852]=0.011204;y_dep[853]=0.011213;y_dep[854]=0.011223;
+        y_dep[855]=0.011232;y_dep[856]=0.011242;y_dep[857]=0.011251;y_dep[858]=0.011261;y_dep[859]=0.01127;
+        y_dep[860]=0.01128;y_dep[861]=0.011289;y_dep[862]=0.011299;y_dep[863]=0.011308;y_dep[864]=0.011318;
+        y_dep[865]=0.011328;y_dep[866]=0.011337;y_dep[867]=0.011347;y_dep[868]=0.011357;y_dep[869]=0.011366;
+        y_dep[870]=0.011376;y_dep[871]=0.011386;y_dep[872]=0.011396;y_dep[873]=0.011405;y_dep[874]=0.011415;
+        y_dep[875]=0.011425;y_dep[876]=0.011435;y_dep[877]=0.011445;y_dep[878]=0.011455;y_dep[879]=0.011465;
+        y_dep[880]=0.011475;y_dep[881]=0.011485;y_dep[882]=0.011494;y_dep[883]=0.011504;y_dep[884]=0.011515;
+        y_dep[885]=0.011525;y_dep[886]=0.011535;y_dep[887]=0.011545;y_dep[888]=0.011555;y_dep[889]=0.011565;
+        y_dep[890]=0.011575;y_dep[891]=0.011585;y_dep[892]=0.011595;y_dep[893]=0.011606;y_dep[894]=0.011616;
+        y_dep[895]=0.011626;y_dep[896]=0.011636;y_dep[897]=0.011647;y_dep[898]=0.011657;y_dep[899]=0.011667;
+        y_dep[900]=0.011678;y_dep[901]=0.011688;y_dep[902]=0.011698;y_dep[903]=0.011709;y_dep[904]=0.011719;
+        y_dep[905]=0.01173;y_dep[906]=0.01174;y_dep[907]=0.011751;y_dep[908]=0.011761;y_dep[909]=0.011772;
+        y_dep[910]=0.011782;y_dep[911]=0.011793;y_dep[912]=0.011804;y_dep[913]=0.011814;y_dep[914]=0.011825;
+        y_dep[915]=0.011836;y_dep[916]=0.011846;y_dep[917]=0.011857;y_dep[918]=0.011868;y_dep[919]=0.011879;
+        y_dep[920]=0.01189;y_dep[921]=0.0119;y_dep[922]=0.011911;y_dep[923]=0.011922;y_dep[924]=0.011933;
+        y_dep[925]=0.011944;y_dep[926]=0.011955;y_dep[927]=0.011966;y_dep[928]=0.011977;y_dep[929]=0.011988;
+        y_dep[930]=0.011999;y_dep[931]=0.01201;y_dep[932]=0.012021;y_dep[933]=0.012032;y_dep[934]=0.012043;
+        y_dep[935]=0.012055;y_dep[936]=0.012066;y_dep[937]=0.012077;y_dep[938]=0.012088;y_dep[939]=0.012099;
+        y_dep[940]=0.012111;y_dep[941]=0.012122;y_dep[942]=0.012133;y_dep[943]=0.012145;y_dep[944]=0.012156;
+        y_dep[945]=0.012168;y_dep[946]=0.012179;y_dep[947]=0.012191;y_dep[948]=0.012202;y_dep[949]=0.012214;
+        y_dep[950]=0.012225;y_dep[951]=0.012237;y_dep[952]=0.012248;y_dep[953]=0.01226;y_dep[954]=0.012272;
+        y_dep[955]=0.012283;y_dep[956]=0.012295;y_dep[957]=0.012307;y_dep[958]=0.012319;y_dep[959]=0.01233;
+        y_dep[960]=0.012342;y_dep[961]=0.012354;y_dep[962]=0.012366;y_dep[963]=0.012378;y_dep[964]=0.01239;
+        y_dep[965]=0.012402;y_dep[966]=0.012414;y_dep[967]=0.012426;y_dep[968]=0.012438;y_dep[969]=0.01245;
+        y_dep[970]=0.012462;y_dep[971]=0.012474;y_dep[972]=0.012486;y_dep[973]=0.012498;y_dep[974]=0.012511;
+        y_dep[975]=0.012523;y_dep[976]=0.012535;y_dep[977]=0.012547;y_dep[978]=0.01256;y_dep[979]=0.012572;
+        y_dep[980]=0.012584;y_dep[981]=0.012597;y_dep[982]=0.012609;y_dep[983]=0.012622;y_dep[984]=0.012634;
+        y_dep[985]=0.012647;y_dep[986]=0.012659;y_dep[987]=0.012672;y_dep[988]=0.012685;y_dep[989]=0.012697;
+        y_dep[990]=0.01271;y_dep[991]=0.012723;y_dep[992]=0.012736;y_dep[993]=0.012748;y_dep[994]=0.012761;
+        y_dep[995]=0.012774;y_dep[996]=0.012787;y_dep[997]=0.0128;y_dep[998]=0.012813;y_dep[999]=0.012826;
+        y_dep[1000]=0.012839;y_dep[1001]=0.012852;y_dep[1002]=0.012865;y_dep[1003]=0.012878;y_dep[1004]=0.012891;
+        y_dep[1005]=0.012904;y_dep[1006]=0.012917;y_dep[1007]=0.012931;y_dep[1008]=0.012944;y_dep[1009]=0.012957;
+        y_dep[1010]=0.012971;y_dep[1011]=0.012984;y_dep[1012]=0.012997;y_dep[1013]=0.013011;y_dep[1014]=0.013024;
+        y_dep[1015]=0.013038;y_dep[1016]=0.013051;y_dep[1017]=0.013065;y_dep[1018]=0.013079;y_dep[1019]=0.013092;
+        y_dep[1020]=0.013106;y_dep[1021]=0.01312;y_dep[1022]=0.013133;y_dep[1023]=0.013147;y_dep[1024]=0.013161;
+        y_dep[1025]=0.013175;y_dep[1026]=0.013189;y_dep[1027]=0.013203;y_dep[1028]=0.013217;y_dep[1029]=0.013231;
+        y_dep[1030]=0.013245;y_dep[1031]=0.013259;y_dep[1032]=0.013273;y_dep[1033]=0.013287;y_dep[1034]=0.013301;
+        y_dep[1035]=0.013315;y_dep[1036]=0.01333;y_dep[1037]=0.013344;y_dep[1038]=0.013358;y_dep[1039]=0.013373;
+        y_dep[1040]=0.013387;y_dep[1041]=0.013402;y_dep[1042]=0.013416;y_dep[1043]=0.013431;y_dep[1044]=0.013445;
+        y_dep[1045]=0.01346;y_dep[1046]=0.013474;y_dep[1047]=0.013489;y_dep[1048]=0.013504;y_dep[1049]=0.013519;
+        y_dep[1050]=0.013533;y_dep[1051]=0.013548;y_dep[1052]=0.013563;y_dep[1053]=0.013578;y_dep[1054]=0.013593;
+        y_dep[1055]=0.013608;y_dep[1056]=0.013623;y_dep[1057]=0.013638;y_dep[1058]=0.013653;y_dep[1059]=0.013669;
+        y_dep[1060]=0.013684;y_dep[1061]=0.013699;y_dep[1062]=0.013714;y_dep[1063]=0.01373;y_dep[1064]=0.013745;
+        y_dep[1065]=0.013761;y_dep[1066]=0.013776;y_dep[1067]=0.013792;y_dep[1068]=0.013807;y_dep[1069]=0.013823;
+        y_dep[1070]=0.013838;y_dep[1071]=0.013854;y_dep[1072]=0.01387;y_dep[1073]=0.013886;y_dep[1074]=0.013901;
+        y_dep[1075]=0.013917;y_dep[1076]=0.013933;y_dep[1077]=0.013949;y_dep[1078]=0.013965;y_dep[1079]=0.013981;
+        y_dep[1080]=0.013997;y_dep[1081]=0.014014;y_dep[1082]=0.01403;y_dep[1083]=0.014046;y_dep[1084]=0.014062;
+        y_dep[1085]=0.014079;y_dep[1086]=0.014095;y_dep[1087]=0.014112;y_dep[1088]=0.014128;y_dep[1089]=0.014145;
+        y_dep[1090]=0.014161;y_dep[1091]=0.014178;y_dep[1092]=0.014194;y_dep[1093]=0.014211;y_dep[1094]=0.014228;
+        y_dep[1095]=0.014245;y_dep[1096]=0.014262;y_dep[1097]=0.014279;y_dep[1098]=0.014296;y_dep[1099]=0.014313;
+        y_dep[1100]=0.01433;y_dep[1101]=0.014347;y_dep[1102]=0.014364;y_dep[1103]=0.014381;y_dep[1104]=0.014399;
+        y_dep[1105]=0.014416;y_dep[1106]=0.014434;y_dep[1107]=0.014451;y_dep[1108]=0.014469;y_dep[1109]=0.014486;
+        y_dep[1110]=0.014504;y_dep[1111]=0.014521;y_dep[1112]=0.014539;y_dep[1113]=0.014557;y_dep[1114]=0.014575;
+        y_dep[1115]=0.014593;y_dep[1116]=0.014611;y_dep[1117]=0.014629;y_dep[1118]=0.014647;y_dep[1119]=0.014665;
+        y_dep[1120]=0.014683;y_dep[1121]=0.014701;y_dep[1122]=0.01472;y_dep[1123]=0.014738;y_dep[1124]=0.014756;
+        y_dep[1125]=0.014775;y_dep[1126]=0.014793;y_dep[1127]=0.014812;y_dep[1128]=0.014831;y_dep[1129]=0.014849;
+        y_dep[1130]=0.014868;y_dep[1131]=0.014887;y_dep[1132]=0.014906;y_dep[1133]=0.014925;y_dep[1134]=0.014944;
+        y_dep[1135]=0.014963;y_dep[1136]=0.014982;y_dep[1137]=0.015001;y_dep[1138]=0.015021;y_dep[1139]=0.01504;
+        y_dep[1140]=0.01506;y_dep[1141]=0.015079;y_dep[1142]=0.015099;y_dep[1143]=0.015118;y_dep[1144]=0.015138;
+        y_dep[1145]=0.015158;y_dep[1146]=0.015177;y_dep[1147]=0.015197;y_dep[1148]=0.015217;y_dep[1149]=0.015237;
+        y_dep[1150]=0.015257;y_dep[1151]=0.015278;y_dep[1152]=0.015298;y_dep[1153]=0.015318;y_dep[1154]=0.015338;
+        y_dep[1155]=0.015359;y_dep[1156]=0.015379;y_dep[1157]=0.0154;y_dep[1158]=0.015421;y_dep[1159]=0.015441;
+        y_dep[1160]=0.015462;y_dep[1161]=0.015483;y_dep[1162]=0.015504;y_dep[1163]=0.015525;y_dep[1164]=0.015546;
+        y_dep[1165]=0.015567;y_dep[1166]=0.015588;y_dep[1167]=0.01561;y_dep[1168]=0.015631;y_dep[1169]=0.015653;
+        y_dep[1170]=0.015674;y_dep[1171]=0.015696;y_dep[1172]=0.015718;y_dep[1173]=0.015739;y_dep[1174]=0.015761;
+        y_dep[1175]=0.015783;y_dep[1176]=0.015805;y_dep[1177]=0.015827;y_dep[1178]=0.015849;y_dep[1179]=0.015872;
+        y_dep[1180]=0.015894;y_dep[1181]=0.015917;y_dep[1182]=0.015939;y_dep[1183]=0.015962;y_dep[1184]=0.015984;
+        y_dep[1185]=0.016007;y_dep[1186]=0.01603;y_dep[1187]=0.016053;y_dep[1188]=0.016076;y_dep[1189]=0.016099;
+        y_dep[1190]=0.016122;y_dep[1191]=0.016146;y_dep[1192]=0.016169;y_dep[1193]=0.016193;y_dep[1194]=0.016216;
+        y_dep[1195]=0.01624;y_dep[1196]=0.016264;y_dep[1197]=0.016287;y_dep[1198]=0.016311;y_dep[1199]=0.016335;
+        y_dep[1200]=0.01636;y_dep[1201]=0.016384;y_dep[1202]=0.016408;y_dep[1203]=0.016433;y_dep[1204]=0.016457;
+        y_dep[1205]=0.016482;y_dep[1206]=0.016506;y_dep[1207]=0.016531;y_dep[1208]=0.016556;y_dep[1209]=0.016581;
+        y_dep[1210]=0.016606;y_dep[1211]=0.016632;y_dep[1212]=0.016657;y_dep[1213]=0.016682;y_dep[1214]=0.016708;
+        y_dep[1215]=0.016734;y_dep[1216]=0.016759;y_dep[1217]=0.016785;y_dep[1218]=0.016811;y_dep[1219]=0.016837;
+        y_dep[1220]=0.016863;y_dep[1221]=0.01689;y_dep[1222]=0.016916;y_dep[1223]=0.016943;y_dep[1224]=0.016969;
+        y_dep[1225]=0.016996;y_dep[1226]=0.017023;y_dep[1227]=0.01705;y_dep[1228]=0.017077;y_dep[1229]=0.017104;
+        y_dep[1230]=0.017132;y_dep[1231]=0.017159;y_dep[1232]=0.017187;y_dep[1233]=0.017214;y_dep[1234]=0.017242;
+        y_dep[1235]=0.01727;y_dep[1236]=0.017298;y_dep[1237]=0.017327;y_dep[1238]=0.017355;y_dep[1239]=0.017383;
+        y_dep[1240]=0.017412;y_dep[1241]=0.017441;y_dep[1242]=0.017469;y_dep[1243]=0.017498;y_dep[1244]=0.017528;
+        y_dep[1245]=0.017557;y_dep[1246]=0.017586;y_dep[1247]=0.017616;y_dep[1248]=0.017645;y_dep[1249]=0.017675;
+        y_dep[1250]=0.017705;y_dep[1251]=0.017735;y_dep[1252]=0.017765;y_dep[1253]=0.017796;y_dep[1254]=0.017826;
+        y_dep[1255]=0.017857;y_dep[1256]=0.017888;y_dep[1257]=0.017919;y_dep[1258]=0.01795;y_dep[1259]=0.017981;
+        y_dep[1260]=0.018012;y_dep[1261]=0.018044;y_dep[1262]=0.018076;y_dep[1263]=0.018108;y_dep[1264]=0.01814;
+        y_dep[1265]=0.018172;y_dep[1266]=0.018204;y_dep[1267]=0.018237;y_dep[1268]=0.018269;y_dep[1269]=0.018302;
+        y_dep[1270]=0.018335;y_dep[1271]=0.018368;y_dep[1272]=0.018402;y_dep[1273]=0.018435;y_dep[1274]=0.018469;
+        y_dep[1275]=0.018503;y_dep[1276]=0.018537;y_dep[1277]=0.018571;y_dep[1278]=0.018605;y_dep[1279]=0.01864;
+        y_dep[1280]=0.018675;y_dep[1281]=0.01871;y_dep[1282]=0.018745;y_dep[1283]=0.01878;y_dep[1284]=0.018816;
+        y_dep[1285]=0.018851;y_dep[1286]=0.018887;y_dep[1287]=0.018923;y_dep[1288]=0.018959;y_dep[1289]=0.018996;
+        y_dep[1290]=0.019033;y_dep[1291]=0.01907;y_dep[1292]=0.019107;y_dep[1293]=0.019144;y_dep[1294]=0.019181;
+        y_dep[1295]=0.019219;y_dep[1296]=0.019257;y_dep[1297]=0.019295;y_dep[1298]=0.019334;y_dep[1299]=0.019372;
+        y_dep[1300]=0.019411;y_dep[1301]=0.01945;y_dep[1302]=0.019489;y_dep[1303]=0.019529;y_dep[1304]=0.019569;
+        y_dep[1305]=0.019609;y_dep[1306]=0.019649;y_dep[1307]=0.019689;y_dep[1308]=0.01973;y_dep[1309]=0.019771;
+        y_dep[1310]=0.019812;y_dep[1311]=0.019853;y_dep[1312]=0.019895;y_dep[1313]=0.019937;y_dep[1314]=0.019979;
+        y_dep[1315]=0.020022;y_dep[1316]=0.020064;y_dep[1317]=0.020107;y_dep[1318]=0.020151;y_dep[1319]=0.020194;
+        y_dep[1320]=0.020238;y_dep[1321]=0.020282;y_dep[1322]=0.020327;y_dep[1323]=0.020371;y_dep[1324]=0.020416;
+        y_dep[1325]=0.020461;y_dep[1326]=0.020507;y_dep[1327]=0.020553;y_dep[1328]=0.020599;y_dep[1329]=0.020645;
+        y_dep[1330]=0.020692;y_dep[1331]=0.020739;y_dep[1332]=0.020787;y_dep[1333]=0.020834;y_dep[1334]=0.020882;
+        y_dep[1335]=0.020931;y_dep[1336]=0.02098;y_dep[1337]=0.021029;y_dep[1338]=0.021078;y_dep[1339]=0.021128;
+        y_dep[1340]=0.021178;y_dep[1341]=0.021228;y_dep[1342]=0.021279;y_dep[1343]=0.02133;y_dep[1344]=0.021382;
+        y_dep[1345]=0.021434;y_dep[1346]=0.021486;y_dep[1347]=0.021539;y_dep[1348]=0.021592;y_dep[1349]=0.021646;
+        y_dep[1350]=0.021699;y_dep[1351]=0.021754;y_dep[1352]=0.021809;y_dep[1353]=0.021864;y_dep[1354]=0.021919;
+        y_dep[1355]=0.021975;y_dep[1356]=0.022032;y_dep[1357]=0.022089;y_dep[1358]=0.022146;y_dep[1359]=0.022204;
+        y_dep[1360]=0.022262;y_dep[1361]=0.022321;y_dep[1362]=0.02238;y_dep[1363]=0.022439;y_dep[1364]=0.0225;
+        y_dep[1365]=0.02256;y_dep[1366]=0.022621;y_dep[1367]=0.022683;y_dep[1368]=0.022745;y_dep[1369]=0.022808;
+        y_dep[1370]=0.022871;y_dep[1371]=0.022935;y_dep[1372]=0.022999;y_dep[1373]=0.023064;y_dep[1374]=0.023129;
+        y_dep[1375]=0.023196;y_dep[1376]=0.023262;y_dep[1377]=0.023329;y_dep[1378]=0.023397;y_dep[1379]=0.023466;
+        y_dep[1380]=0.023535;y_dep[1381]=0.023604;y_dep[1382]=0.023675;y_dep[1383]=0.023745;y_dep[1384]=0.023817;
+        y_dep[1385]=0.023889;y_dep[1386]=0.023962;y_dep[1387]=0.024036;y_dep[1388]=0.02411;y_dep[1389]=0.024186;
+        y_dep[1390]=0.024261;y_dep[1391]=0.024338;y_dep[1392]=0.024415;y_dep[1393]=0.024494;y_dep[1394]=0.024572;
+        y_dep[1395]=0.024652;y_dep[1396]=0.024733;y_dep[1397]=0.024814;y_dep[1398]=0.024896;y_dep[1399]=0.024979;
+        y_dep[1400]=0.025063;y_dep[1401]=0.025148;y_dep[1402]=0.025234;y_dep[1403]=0.02532;y_dep[1404]=0.025408;
+        y_dep[1405]=0.025496;y_dep[1406]=0.025586;y_dep[1407]=0.025676;y_dep[1408]=0.025768;y_dep[1409]=0.02586;
+        y_dep[1410]=0.025954;y_dep[1411]=0.026048;y_dep[1412]=0.026144;y_dep[1413]=0.026241;y_dep[1414]=0.026339;
+        y_dep[1415]=0.026438;y_dep[1416]=0.026538;y_dep[1417]=0.02664;y_dep[1418]=0.026743;y_dep[1419]=0.026847;
+        y_dep[1420]=0.026952;y_dep[1421]=0.027058;y_dep[1422]=0.027166;y_dep[1423]=0.027275;y_dep[1424]=0.027386;
+        y_dep[1425]=0.027498;y_dep[1426]=0.027611;y_dep[1427]=0.027726;y_dep[1428]=0.027843;y_dep[1429]=0.027961;
+        y_dep[1430]=0.02808;y_dep[1431]=0.028201;y_dep[1432]=0.028324;y_dep[1433]=0.028448;y_dep[1434]=0.028574;
+        y_dep[1435]=0.028702;y_dep[1436]=0.028831;y_dep[1437]=0.028963;y_dep[1438]=0.029096;y_dep[1439]=0.029231;
+        y_dep[1440]=0.029368;y_dep[1441]=0.029507;y_dep[1442]=0.029648;y_dep[1443]=0.029791;y_dep[1444]=0.029936;
+        y_dep[1445]=0.030083;y_dep[1446]=0.030233;y_dep[1447]=0.030385;y_dep[1448]=0.030538;y_dep[1449]=0.030695;
+        y_dep[1450]=0.030853;y_dep[1451]=0.031014;y_dep[1452]=0.031178;y_dep[1453]=0.031344;y_dep[1454]=0.031513;
+        y_dep[1455]=0.031684;y_dep[1456]=0.031858;y_dep[1457]=0.032035;y_dep[1458]=0.032214;y_dep[1459]=0.032396;
+        y_dep[1460]=0.032582;y_dep[1461]=0.03277;y_dep[1462]=0.032961;y_dep[1463]=0.033155;y_dep[1464]=0.033353;
+        y_dep[1465]=0.033553;y_dep[1466]=0.033757;y_dep[1467]=0.033964;y_dep[1468]=0.034174;y_dep[1469]=0.034388;
+        y_dep[1470]=0.034605;y_dep[1471]=0.034826;y_dep[1472]=0.03505;y_dep[1473]=0.035278;y_dep[1474]=0.03551;
+        y_dep[1475]=0.035745;y_dep[1476]=0.035983;y_dep[1477]=0.036226;y_dep[1478]=0.036472;y_dep[1479]=0.036722;
+        y_dep[1480]=0.036976;y_dep[1481]=0.037234;y_dep[1482]=0.037495;y_dep[1483]=0.037761;y_dep[1484]=0.03803;
+        y_dep[1485]=0.038303;y_dep[1486]=0.03858;y_dep[1487]=0.038861;y_dep[1488]=0.039145;y_dep[1489]=0.039434;
+        y_dep[1490]=0.039726;y_dep[1491]=0.040021;y_dep[1492]=0.040321;y_dep[1493]=0.040624;y_dep[1494]=0.04093;
+        y_dep[1495]=0.04124;y_dep[1496]=0.041554;y_dep[1497]=0.04187;y_dep[1498]=0.04219;y_dep[1499]=0.042513;
+        y_dep[1500]=0.042839;y_dep[1501]=0.043168;y_dep[1502]=0.0435;y_dep[1503]=0.043834;y_dep[1504]=0.044171;
+        y_dep[1505]=0.04451;y_dep[1506]=0.044852;y_dep[1507]=0.045195;y_dep[1508]=0.045541;y_dep[1509]=0.045889;
+        y_dep[1510]=0.046238;y_dep[1511]=0.046589;y_dep[1512]=0.046942;y_dep[1513]=0.047296;y_dep[1514]=0.047651;
+        y_dep[1515]=0.048007;y_dep[1516]=0.048365;y_dep[1517]=0.048723;y_dep[1518]=0.049082;y_dep[1519]=0.049442;
+        y_dep[1520]=0.049803;y_dep[1521]=0.050164;y_dep[1522]=0.050526;y_dep[1523]=0.050888;y_dep[1524]=0.051251;
+        y_dep[1525]=0.051614;y_dep[1526]=0.051978;y_dep[1527]=0.052342;y_dep[1528]=0.052706;y_dep[1529]=0.053071;
+        y_dep[1530]=0.053436;y_dep[1531]=0.053801;y_dep[1532]=0.054167;y_dep[1533]=0.054533;y_dep[1534]=0.054899;
+        y_dep[1535]=0.055266;y_dep[1536]=0.055634;y_dep[1537]=0.056002;y_dep[1538]=0.05637;y_dep[1539]=0.05674;
+        y_dep[1540]=0.057109;y_dep[1541]=0.05748;y_dep[1542]=0.057852;y_dep[1543]=0.058224;y_dep[1544]=0.058597;
+        y_dep[1545]=0.058972;y_dep[1546]=0.059347;y_dep[1547]=0.059724;y_dep[1548]=0.060102;y_dep[1549]=0.060481;
+        y_dep[1550]=0.060861;y_dep[1551]=0.061243;y_dep[1552]=0.061626;y_dep[1553]=0.062011;y_dep[1554]=0.062397;
+        y_dep[1555]=0.062784;y_dep[1556]=0.063174;y_dep[1557]=0.063565;y_dep[1558]=0.063957;y_dep[1559]=0.064352;
+        y_dep[1560]=0.064747;y_dep[1561]=0.065145;y_dep[1562]=0.065544;y_dep[1563]=0.065945;y_dep[1564]=0.066347;
+        y_dep[1565]=0.066751;y_dep[1566]=0.067157;y_dep[1567]=0.067564;y_dep[1568]=0.067972;y_dep[1569]=0.068382;
+        y_dep[1570]=0.068793;y_dep[1571]=0.069205;y_dep[1572]=0.069619;y_dep[1573]=0.070033;y_dep[1574]=0.070449;
+        y_dep[1575]=0.070865;y_dep[1576]=0.071282;y_dep[1577]=0.0717;y_dep[1578]=0.072119;y_dep[1579]=0.072538;
+        y_dep[1580]=0.072957;y_dep[1581]=0.073377;y_dep[1582]=0.073797;y_dep[1583]=0.074217;y_dep[1584]=0.074637;
+        y_dep[1585]=0.075057;y_dep[1586]=0.075477;y_dep[1587]=0.075896;y_dep[1588]=0.076316;y_dep[1589]=0.076735;
+        y_dep[1590]=0.077154;y_dep[1591]=0.077572;y_dep[1592]=0.07799;y_dep[1593]=0.078407;y_dep[1594]=0.078824;
+        y_dep[1595]=0.079241;y_dep[1596]=0.079656;y_dep[1597]=0.080072;y_dep[1598]=0.080486;y_dep[1599]=0.080901;
+        y_dep[1600]=0.081314;y_dep[1601]=0.081728;y_dep[1602]=0.08214;y_dep[1603]=0.082553;y_dep[1604]=0.082965;
+        y_dep[1605]=0.083377;y_dep[1606]=0.083789;y_dep[1607]=0.0842;y_dep[1608]=0.084611;y_dep[1609]=0.085023;
+        y_dep[1610]=0.085434;y_dep[1611]=0.085846;y_dep[1612]=0.086257;y_dep[1613]=0.086669;y_dep[1614]=0.087082;
+        y_dep[1615]=0.087495;y_dep[1616]=0.087908;y_dep[1617]=0.088322;y_dep[1618]=0.088736;y_dep[1619]=0.089152;
+        y_dep[1620]=0.089568;y_dep[1621]=0.089985;y_dep[1622]=0.090403;y_dep[1623]=0.090822;y_dep[1624]=0.091242;
+        y_dep[1625]=0.091663;y_dep[1626]=0.092085;y_dep[1627]=0.092508;y_dep[1628]=0.092933;y_dep[1629]=0.093358;
+        y_dep[1630]=0.093785;y_dep[1631]=0.094213;y_dep[1632]=0.094643;y_dep[1633]=0.095073;y_dep[1634]=0.095505;
+        y_dep[1635]=0.095938;y_dep[1636]=0.096372;y_dep[1637]=0.096807;y_dep[1638]=0.097243;y_dep[1639]=0.09768;
+        y_dep[1640]=0.098118;y_dep[1641]=0.098557;y_dep[1642]=0.098997;y_dep[1643]=0.099437;y_dep[1644]=0.099878;
+        y_dep[1645]=0.10032;y_dep[1646]=0.100762;y_dep[1647]=0.101204;y_dep[1648]=0.101647;y_dep[1649]=0.10209;
+        y_dep[1650]=0.102533;y_dep[1651]=0.102975;y_dep[1652]=0.103418;y_dep[1653]=0.103861;y_dep[1654]=0.104303;
+        y_dep[1655]=0.104745;y_dep[1656]=0.105187;y_dep[1657]=0.105628;y_dep[1658]=0.106069;y_dep[1659]=0.106509;
+        y_dep[1660]=0.106948;y_dep[1661]=0.107387;y_dep[1662]=0.107825;y_dep[1663]=0.108262;y_dep[1664]=0.108698;
+        y_dep[1665]=0.109134;y_dep[1666]=0.109569;y_dep[1667]=0.110003;y_dep[1668]=0.110437;y_dep[1669]=0.110869;
+        y_dep[1670]=0.111301;y_dep[1671]=0.111733;y_dep[1672]=0.112164;y_dep[1673]=0.112594;y_dep[1674]=0.113023;
+        y_dep[1675]=0.113453;y_dep[1676]=0.113881;y_dep[1677]=0.11431;y_dep[1678]=0.114738;y_dep[1679]=0.115166;
+        y_dep[1680]=0.115594;y_dep[1681]=0.116022;y_dep[1682]=0.11645;y_dep[1683]=0.116878;y_dep[1684]=0.117306;
+        y_dep[1685]=0.117735;y_dep[1686]=0.118164;y_dep[1687]=0.118593;y_dep[1688]=0.119023;y_dep[1689]=0.119454;
+        y_dep[1690]=0.119885;y_dep[1691]=0.120317;y_dep[1692]=0.120749;y_dep[1693]=0.121183;y_dep[1694]=0.121617;
+        y_dep[1695]=0.122053;y_dep[1696]=0.122489;y_dep[1697]=0.122926;y_dep[1698]=0.123365;y_dep[1699]=0.123804;
+        y_dep[1700]=0.124245;y_dep[1701]=0.124687;y_dep[1702]=0.125129;y_dep[1703]=0.125573;y_dep[1704]=0.126018;
+        y_dep[1705]=0.126464;y_dep[1706]=0.126911;y_dep[1707]=0.127359;y_dep[1708]=0.127808;y_dep[1709]=0.128257;
+        y_dep[1710]=0.128708;y_dep[1711]=0.129159;y_dep[1712]=0.129611;y_dep[1713]=0.130063;y_dep[1714]=0.130516;
+        y_dep[1715]=0.130969;y_dep[1716]=0.131423;y_dep[1717]=0.131877;y_dep[1718]=0.132331;y_dep[1719]=0.132785;
+        y_dep[1720]=0.133239;y_dep[1721]=0.133693;y_dep[1722]=0.134146;y_dep[1723]=0.1346;y_dep[1724]=0.135053;
+        y_dep[1725]=0.135505;y_dep[1726]=0.135957;y_dep[1727]=0.136409;y_dep[1728]=0.136859;y_dep[1729]=0.137309;
+        y_dep[1730]=0.137759;y_dep[1731]=0.138207;y_dep[1732]=0.138655;y_dep[1733]=0.139102;y_dep[1734]=0.139548;
+        y_dep[1735]=0.139993;y_dep[1736]=0.140438;y_dep[1737]=0.140881;y_dep[1738]=0.141324;y_dep[1739]=0.141766;
+        y_dep[1740]=0.142207;y_dep[1741]=0.142648;y_dep[1742]=0.143087;y_dep[1743]=0.143526;y_dep[1744]=0.143965;
+        y_dep[1745]=0.144403;y_dep[1746]=0.144841;y_dep[1747]=0.145278;y_dep[1748]=0.145715;y_dep[1749]=0.146151;
+        y_dep[1750]=0.146588;y_dep[1751]=0.147024;y_dep[1752]=0.14746;y_dep[1753]=0.147897;y_dep[1754]=0.148334;
+        y_dep[1755]=0.14877;y_dep[1756]=0.149208;y_dep[1757]=0.149645;y_dep[1758]=0.150083;y_dep[1759]=0.150522;
+        y_dep[1760]=0.150961;y_dep[1761]=0.151401;y_dep[1762]=0.151842;y_dep[1763]=0.152283;y_dep[1764]=0.152726;
+        y_dep[1765]=0.153169;y_dep[1766]=0.153613;y_dep[1767]=0.154058;y_dep[1768]=0.154504;y_dep[1769]=0.154952;
+        y_dep[1770]=0.1554;y_dep[1771]=0.155849;y_dep[1772]=0.156299;y_dep[1773]=0.156751;y_dep[1774]=0.157203;
+        y_dep[1775]=0.157656;y_dep[1776]=0.15811;y_dep[1777]=0.158565;y_dep[1778]=0.159021;y_dep[1779]=0.159478;
+        y_dep[1780]=0.159935;y_dep[1781]=0.160394;y_dep[1782]=0.160852;y_dep[1783]=0.161311;y_dep[1784]=0.161771;
+        y_dep[1785]=0.162231;y_dep[1786]=0.162691;y_dep[1787]=0.163151;y_dep[1788]=0.163612;y_dep[1789]=0.164072;
+        y_dep[1790]=0.164533;y_dep[1791]=0.164993;y_dep[1792]=0.165453;y_dep[1793]=0.165912;y_dep[1794]=0.166371;
+        y_dep[1795]=0.16683;y_dep[1796]=0.167287;y_dep[1797]=0.167745;y_dep[1798]=0.168201;y_dep[1799]=0.168657;
+        y_dep[1800]=0.169112;y_dep[1801]=0.169566;y_dep[1802]=0.17002;y_dep[1803]=0.170472;y_dep[1804]=0.170924;
+        y_dep[1805]=0.171375;y_dep[1806]=0.171824;y_dep[1807]=0.172273;y_dep[1808]=0.172722;y_dep[1809]=0.173169;
+        y_dep[1810]=0.173615;y_dep[1811]=0.174061;y_dep[1812]=0.174506;y_dep[1813]=0.17495;y_dep[1814]=0.175394;
+        y_dep[1815]=0.175837;y_dep[1816]=0.17628;y_dep[1817]=0.176723;y_dep[1818]=0.177165;y_dep[1819]=0.177606;
+        y_dep[1820]=0.178048;y_dep[1821]=0.17849;y_dep[1822]=0.178931;y_dep[1823]=0.179373;y_dep[1824]=0.179814;
+        y_dep[1825]=0.180256;y_dep[1826]=0.180699;y_dep[1827]=0.181141;y_dep[1828]=0.181584;y_dep[1829]=0.182028;
+        y_dep[1830]=0.182472;y_dep[1831]=0.182917;y_dep[1832]=0.183363;y_dep[1833]=0.183809;y_dep[1834]=0.184257;
+        y_dep[1835]=0.184705;y_dep[1836]=0.185154;y_dep[1837]=0.185604;y_dep[1838]=0.186055;y_dep[1839]=0.186507;
+        y_dep[1840]=0.18696;y_dep[1841]=0.187414;y_dep[1842]=0.187869;y_dep[1843]=0.188325;y_dep[1844]=0.188782;
+        y_dep[1845]=0.18924;y_dep[1846]=0.189699;y_dep[1847]=0.190158;y_dep[1848]=0.190619;y_dep[1849]=0.19108;
+        y_dep[1850]=0.191542;y_dep[1851]=0.192004;y_dep[1852]=0.192467;y_dep[1853]=0.192931;y_dep[1854]=0.193395;
+        y_dep[1855]=0.193859;y_dep[1856]=0.194323;y_dep[1857]=0.194788;y_dep[1858]=0.195252;y_dep[1859]=0.195717;
+        y_dep[1860]=0.196181;y_dep[1861]=0.196645;y_dep[1862]=0.197109;y_dep[1863]=0.197572;y_dep[1864]=0.198035;
+        y_dep[1865]=0.198497;y_dep[1866]=0.198959;y_dep[1867]=0.19942;y_dep[1868]=0.19988;y_dep[1869]=0.20034;
+        y_dep[1870]=0.200798;y_dep[1871]=0.201256;y_dep[1872]=0.201713;y_dep[1873]=0.202169;y_dep[1874]=0.202624;
+        y_dep[1875]=0.203078;y_dep[1876]=0.203532;y_dep[1877]=0.203984;y_dep[1878]=0.204435;y_dep[1879]=0.204886;
+        y_dep[1880]=0.205336;y_dep[1881]=0.205785;y_dep[1882]=0.206234;y_dep[1883]=0.206681;y_dep[1884]=0.207129;
+        y_dep[1885]=0.207575;y_dep[1886]=0.208021;y_dep[1887]=0.208467;y_dep[1888]=0.208912;y_dep[1889]=0.209358;
+        y_dep[1890]=0.209803;y_dep[1891]=0.210247;y_dep[1892]=0.210692;y_dep[1893]=0.211137;y_dep[1894]=0.211582;
+        y_dep[1895]=0.212028;y_dep[1896]=0.212473;y_dep[1897]=0.212919;y_dep[1898]=0.213366;y_dep[1899]=0.213813;
+        y_dep[1900]=0.214261;y_dep[1901]=0.214709;y_dep[1902]=0.215158;y_dep[1903]=0.215608;y_dep[1904]=0.216058;
+        y_dep[1905]=0.21651;y_dep[1906]=0.216962;y_dep[1907]=0.217416;y_dep[1908]=0.21787;y_dep[1909]=0.218326;
+        y_dep[1910]=0.218782;y_dep[1911]=0.219239;y_dep[1912]=0.219697;y_dep[1913]=0.220157;y_dep[1914]=0.220617;
+        y_dep[1915]=0.221078;y_dep[1916]=0.22154;y_dep[1917]=0.222003;y_dep[1918]=0.222466;y_dep[1919]=0.222931;
+        y_dep[1920]=0.223396;y_dep[1921]=0.223861;y_dep[1922]=0.224327;y_dep[1923]=0.224794;y_dep[1924]=0.225261;
+        y_dep[1925]=0.225728;y_dep[1926]=0.226195;y_dep[1927]=0.226662;y_dep[1928]=0.227129;y_dep[1929]=0.227597;
+        y_dep[1930]=0.228064;y_dep[1931]=0.22853;y_dep[1932]=0.228997;y_dep[1933]=0.229463;y_dep[1934]=0.229928;
+        y_dep[1935]=0.230393;y_dep[1936]=0.230857;y_dep[1937]=0.23132;y_dep[1938]=0.231783;y_dep[1939]=0.232245;
+        y_dep[1940]=0.232706;y_dep[1941]=0.233166;y_dep[1942]=0.233625;y_dep[1943]=0.234084;y_dep[1944]=0.234541;
+        y_dep[1945]=0.234998;y_dep[1946]=0.235453;y_dep[1947]=0.235908;y_dep[1948]=0.236362;y_dep[1949]=0.236815;
+        y_dep[1950]=0.237267;y_dep[1951]=0.237719;y_dep[1952]=0.238169;y_dep[1953]=0.238619;y_dep[1954]=0.239069;
+        y_dep[1955]=0.239518;y_dep[1956]=0.239966;y_dep[1957]=0.240414;y_dep[1958]=0.240862;y_dep[1959]=0.241309;
+        y_dep[1960]=0.241757;y_dep[1961]=0.242204;y_dep[1962]=0.242651;y_dep[1963]=0.243098;y_dep[1964]=0.243546;
+        y_dep[1965]=0.243994;y_dep[1966]=0.244442;y_dep[1967]=0.24489;y_dep[1968]=0.245339;y_dep[1969]=0.245789;
+        y_dep[1970]=0.246239;y_dep[1971]=0.246689;y_dep[1972]=0.247141;y_dep[1973]=0.247593;y_dep[1974]=0.248046;
+        y_dep[1975]=0.2485;y_dep[1976]=0.248955;y_dep[1977]=0.249411;y_dep[1978]=0.249868;y_dep[1979]=0.250326;
+        y_dep[1980]=0.250784;y_dep[1981]=0.251244;y_dep[1982]=0.251705;y_dep[1983]=0.252166;y_dep[1984]=0.252629;
+        y_dep[1985]=0.253092;y_dep[1986]=0.253557;y_dep[1987]=0.254022;y_dep[1988]=0.254488;y_dep[1989]=0.254954;
+        y_dep[1990]=0.255421;y_dep[1991]=0.255889;y_dep[1992]=0.256357;y_dep[1993]=0.256826;y_dep[1994]=0.257295;
+        y_dep[1995]=0.257764;y_dep[1996]=0.258233;y_dep[1997]=0.258702;y_dep[1998]=0.259172;y_dep[1999]=0.259641;
+        y_dep[2000]=0.26011;y_dep[2001]=0.260578;y_dep[2002]=0.261046;y_dep[2003]=0.261514;y_dep[2004]=0.261981;
+        y_dep[2005]=0.262448;y_dep[2006]=0.262914;y_dep[2007]=0.263379;y_dep[2008]=0.263843;y_dep[2009]=0.264307;
+        y_dep[2010]=0.26477;y_dep[2011]=0.265231;y_dep[2012]=0.265692;y_dep[2013]=0.266152;y_dep[2014]=0.266611;
+        y_dep[2015]=0.267069;y_dep[2016]=0.267527;y_dep[2017]=0.267983;y_dep[2018]=0.268438;y_dep[2019]=0.268893;
+        y_dep[2020]=0.269347;y_dep[2021]=0.2698;y_dep[2022]=0.270252;y_dep[2023]=0.270704;y_dep[2024]=0.271155;
+        y_dep[2025]=0.271605;y_dep[2026]=0.272056;y_dep[2027]=0.272505;y_dep[2028]=0.272955;y_dep[2029]=0.273404;
+        y_dep[2030]=0.273853;y_dep[2031]=0.274302;y_dep[2032]=0.274751;y_dep[2033]=0.2752;y_dep[2034]=0.275649;
+        y_dep[2035]=0.276098;y_dep[2036]=0.276548;y_dep[2037]=0.276998;y_dep[2038]=0.277449;y_dep[2039]=0.2779;
+        y_dep[2040]=0.278352;y_dep[2041]=0.278805;y_dep[2042]=0.279258;y_dep[2043]=0.279712;y_dep[2044]=0.280167;
+        y_dep[2045]=0.280623;y_dep[2046]=0.28108;y_dep[2047]=0.281537;y_dep[2048]=0.281996;y_dep[2049]=0.282456;
+        y_dep[2050]=0.282916;y_dep[2051]=0.283378;y_dep[2052]=0.28384;y_dep[2053]=0.284304;y_dep[2054]=0.284768;
+        y_dep[2055]=0.285233;y_dep[2056]=0.285699;y_dep[2057]=0.286166;y_dep[2058]=0.286634;y_dep[2059]=0.287102;
+        y_dep[2060]=0.287571;y_dep[2061]=0.28804;y_dep[2062]=0.28851;y_dep[2063]=0.28898;y_dep[2064]=0.28945;
+        y_dep[2065]=0.289921;y_dep[2066]=0.290392;y_dep[2067]=0.290863;y_dep[2068]=0.291333;y_dep[2069]=0.291804;
+        y_dep[2070]=0.292274;y_dep[2071]=0.292744;y_dep[2072]=0.293213;y_dep[2073]=0.293683;y_dep[2074]=0.294151;
+        y_dep[2075]=0.294619;y_dep[2076]=0.295086;y_dep[2077]=0.295552;y_dep[2078]=0.296018;y_dep[2079]=0.296483;
+        y_dep[2080]=0.296947;y_dep[2081]=0.297409;y_dep[2082]=0.297872;y_dep[2083]=0.298333;y_dep[2084]=0.298793;
+        y_dep[2085]=0.299252;y_dep[2086]=0.29971;y_dep[2087]=0.300168;y_dep[2088]=0.300624;y_dep[2089]=0.30108;
+        y_dep[2090]=0.301535;y_dep[2091]=0.301989;y_dep[2092]=0.302443;y_dep[2093]=0.302895;y_dep[2094]=0.303348;
+        y_dep[2095]=0.303799;y_dep[2096]=0.304251;y_dep[2097]=0.304702;y_dep[2098]=0.305152;y_dep[2099]=0.305603;
+        y_dep[2100]=0.306053;y_dep[2101]=0.306503;y_dep[2102]=0.306953;y_dep[2103]=0.307404;y_dep[2104]=0.307854;
+        y_dep[2105]=0.308305;y_dep[2106]=0.308756;y_dep[2107]=0.309208;y_dep[2108]=0.30966;y_dep[2109]=0.310112;
+        y_dep[2110]=0.310566;y_dep[2111]=0.31102;y_dep[2112]=0.311474;y_dep[2113]=0.31193;y_dep[2114]=0.312386;
+        y_dep[2115]=0.312843;y_dep[2116]=0.313302;y_dep[2117]=0.313761;y_dep[2118]=0.314221;y_dep[2119]=0.314682;
+        y_dep[2120]=0.315144;y_dep[2121]=0.315607;y_dep[2122]=0.31607;y_dep[2123]=0.316535;y_dep[2124]=0.317001;
+        y_dep[2125]=0.317468;y_dep[2126]=0.317935;y_dep[2127]=0.318403;y_dep[2128]=0.318872;y_dep[2129]=0.319341;
+        y_dep[2130]=0.319812;y_dep[2131]=0.320282;y_dep[2132]=0.320753;y_dep[2133]=0.321224;y_dep[2134]=0.321696;
+        y_dep[2135]=0.322168;y_dep[2136]=0.32264;y_dep[2137]=0.323112;y_dep[2138]=0.323583;y_dep[2139]=0.324055;
+        y_dep[2140]=0.324526;y_dep[2141]=0.324997;y_dep[2142]=0.325467;y_dep[2143]=0.325937;y_dep[2144]=0.326407;
+        y_dep[2145]=0.326875;y_dep[2146]=0.327343;y_dep[2147]=0.327811;y_dep[2148]=0.328277;y_dep[2149]=0.328743;
+        y_dep[2150]=0.329207;y_dep[2151]=0.329671;y_dep[2152]=0.330134;y_dep[2153]=0.330596;y_dep[2154]=0.331057;
+        y_dep[2155]=0.331517;y_dep[2156]=0.331976;y_dep[2157]=0.332434;y_dep[2158]=0.332891;y_dep[2159]=0.333348;
+        y_dep[2160]=0.333804;y_dep[2161]=0.334259;y_dep[2162]=0.334713;y_dep[2163]=0.335166;y_dep[2164]=0.33562;
+        y_dep[2165]=0.336072;y_dep[2166]=0.336524;y_dep[2167]=0.336976;y_dep[2168]=0.337427;y_dep[2169]=0.337879;
+        y_dep[2170]=0.33833;y_dep[2171]=0.338781;y_dep[2172]=0.339232;y_dep[2173]=0.339684;y_dep[2174]=0.340135;
+        y_dep[2175]=0.340587;y_dep[2176]=0.341039;y_dep[2177]=0.341492;y_dep[2178]=0.341945;y_dep[2179]=0.342399;
+        y_dep[2180]=0.342853;y_dep[2181]=0.343308;y_dep[2182]=0.343764;y_dep[2183]=0.34422;y_dep[2184]=0.344678;
+        y_dep[2185]=0.345136;y_dep[2186]=0.345596;y_dep[2187]=0.346056;y_dep[2188]=0.346517;y_dep[2189]=0.346979;
+        y_dep[2190]=0.347442;y_dep[2191]=0.347906;y_dep[2192]=0.348371;y_dep[2193]=0.348837;y_dep[2194]=0.349304;
+        y_dep[2195]=0.349771;y_dep[2196]=0.35024;y_dep[2197]=0.350709;y_dep[2198]=0.351179;y_dep[2199]=0.351649;
+        y_dep[2200]=0.35212;y_dep[2201]=0.352592;y_dep[2202]=0.353064;y_dep[2203]=0.353536;y_dep[2204]=0.354009;
+        y_dep[2205]=0.354481;y_dep[2206]=0.354954;y_dep[2207]=0.355427;y_dep[2208]=0.355899;y_dep[2209]=0.356371;
+        y_dep[2210]=0.356843;y_dep[2211]=0.357315;y_dep[2212]=0.357786;y_dep[2213]=0.358257;y_dep[2214]=0.358727;
+        y_dep[2215]=0.359196;y_dep[2216]=0.359665;y_dep[2217]=0.360132;y_dep[2218]=0.360599;y_dep[2219]=0.361065;
+        y_dep[2220]=0.361531;y_dep[2221]=0.361995;y_dep[2222]=0.362458;y_dep[2223]=0.362921;y_dep[2224]=0.363382;
+        y_dep[2225]=0.363843;y_dep[2226]=0.364302;y_dep[2227]=0.364761;y_dep[2228]=0.365219;y_dep[2229]=0.365676;
+        y_dep[2230]=0.366132;y_dep[2231]=0.366588;y_dep[2232]=0.367042;y_dep[2233]=0.367497;y_dep[2234]=0.36795;
+        y_dep[2235]=0.368403;y_dep[2236]=0.368856;y_dep[2237]=0.369309;y_dep[2238]=0.369761;y_dep[2239]=0.370213;
+        y_dep[2240]=0.370665;y_dep[2241]=0.371116;y_dep[2242]=0.371568;y_dep[2243]=0.37202;y_dep[2244]=0.372473;
+        y_dep[2245]=0.372925;y_dep[2246]=0.373378;y_dep[2247]=0.373832;y_dep[2248]=0.374286;y_dep[2249]=0.37474;
+        y_dep[2250]=0.375195;y_dep[2251]=0.375651;y_dep[2252]=0.376108;y_dep[2253]=0.376565;y_dep[2254]=0.377024;
+        y_dep[2255]=0.377483;y_dep[2256]=0.377943;y_dep[2257]=0.378404;y_dep[2258]=0.378866;y_dep[2259]=0.379329;
+        y_dep[2260]=0.379793;y_dep[2261]=0.380258;y_dep[2262]=0.380724;y_dep[2263]=0.381191;y_dep[2264]=0.381658;
+        y_dep[2265]=0.382127;y_dep[2266]=0.382596;y_dep[2267]=0.383066;y_dep[2268]=0.383537;y_dep[2269]=0.384008;
+        y_dep[2270]=0.38448;y_dep[2271]=0.384952;y_dep[2272]=0.385425;y_dep[2273]=0.385898;y_dep[2274]=0.386371;
+        y_dep[2275]=0.386844;y_dep[2276]=0.387317;y_dep[2277]=0.38779;y_dep[2278]=0.388263;y_dep[2279]=0.388736;
+        y_dep[2280]=0.389209;y_dep[2281]=0.389681;y_dep[2282]=0.390152;y_dep[2283]=0.390623;y_dep[2284]=0.391094;
+        y_dep[2285]=0.391564;y_dep[2286]=0.392032;y_dep[2287]=0.392501;y_dep[2288]=0.392968;y_dep[2289]=0.393434;
+        y_dep[2290]=0.3939;y_dep[2291]=0.394365;y_dep[2292]=0.394828;y_dep[2293]=0.395291;y_dep[2294]=0.395753;
+        y_dep[2295]=0.396213;y_dep[2296]=0.396673;y_dep[2297]=0.397132;y_dep[2298]=0.397591;y_dep[2299]=0.398048;
+        y_dep[2300]=0.398505;y_dep[2301]=0.39896;y_dep[2302]=0.399416;y_dep[2303]=0.39987;y_dep[2304]=0.400324;
+        y_dep[2305]=0.400778;y_dep[2306]=0.401231;y_dep[2307]=0.401684;y_dep[2308]=0.402136;y_dep[2309]=0.402589;
+        y_dep[2310]=0.403041;y_dep[2311]=0.403494;y_dep[2312]=0.403946;y_dep[2313]=0.404399;y_dep[2314]=0.404851;
+        y_dep[2315]=0.405305;y_dep[2316]=0.405758;y_dep[2317]=0.406212;y_dep[2318]=0.406667;y_dep[2319]=0.407122;
+        y_dep[2320]=0.407578;y_dep[2321]=0.408034;y_dep[2322]=0.408492;y_dep[2323]=0.40895;y_dep[2324]=0.409409;
+        y_dep[2325]=0.409869;y_dep[2326]=0.41033;y_dep[2327]=0.410792;y_dep[2328]=0.411254;y_dep[2329]=0.411718;
+        y_dep[2330]=0.412183;y_dep[2331]=0.412648;y_dep[2332]=0.413115;y_dep[2333]=0.413582;y_dep[2334]=0.414051;
+        y_dep[2335]=0.41452;y_dep[2336]=0.41499;y_dep[2337]=0.41546;y_dep[2338]=0.415931;y_dep[2339]=0.416403;
+        y_dep[2340]=0.416876;y_dep[2341]=0.417348;y_dep[2342]=0.417822;y_dep[2343]=0.418295;y_dep[2344]=0.418769;
+        y_dep[2345]=0.419242;y_dep[2346]=0.419716;y_dep[2347]=0.420189;y_dep[2348]=0.420663;y_dep[2349]=0.421136;
+        y_dep[2350]=0.421609;y_dep[2351]=0.422081;y_dep[2352]=0.422553;y_dep[2353]=0.423024;y_dep[2354]=0.423495;
+        y_dep[2355]=0.423965;y_dep[2356]=0.424434;y_dep[2357]=0.424902;y_dep[2358]=0.42537;y_dep[2359]=0.425836;
+        y_dep[2360]=0.426302;y_dep[2361]=0.426767;y_dep[2362]=0.427231;y_dep[2363]=0.427693;y_dep[2364]=0.428155;
+        y_dep[2365]=0.428616;y_dep[2366]=0.429076;y_dep[2367]=0.429536;y_dep[2368]=0.429994;y_dep[2369]=0.430451;
+        y_dep[2370]=0.430908;y_dep[2371]=0.431364;y_dep[2372]=0.43182;y_dep[2373]=0.432274;y_dep[2374]=0.432729;
+        y_dep[2375]=0.433182;y_dep[2376]=0.433636;y_dep[2377]=0.434089;y_dep[2378]=0.434542;y_dep[2379]=0.434995;
+        y_dep[2380]=0.435447;y_dep[2381]=0.4359;y_dep[2382]=0.436353;y_dep[2383]=0.436806;y_dep[2384]=0.437259;
+        y_dep[2385]=0.437713;y_dep[2386]=0.438167;y_dep[2387]=0.438621;y_dep[2388]=0.439076;y_dep[2389]=0.439532;
+        y_dep[2390]=0.439988;y_dep[2391]=0.440445;y_dep[2392]=0.440903;y_dep[2393]=0.441362;y_dep[2394]=0.441822;
+        y_dep[2395]=0.442282;y_dep[2396]=0.442743;y_dep[2397]=0.443206;y_dep[2398]=0.443669;y_dep[2399]=0.444133;
+        y_dep[2400]=0.444599;y_dep[2401]=0.445065;y_dep[2402]=0.445532;y_dep[2403]=0.446;y_dep[2404]=0.446468;
+        y_dep[2405]=0.446938;y_dep[2406]=0.447408;y_dep[2407]=0.44788;y_dep[2408]=0.448351;y_dep[2409]=0.448823;
+        y_dep[2410]=0.449296;y_dep[2411]=0.449769;y_dep[2412]=0.450243;y_dep[2413]=0.450717;y_dep[2414]=0.45119;
+        y_dep[2415]=0.451664;y_dep[2416]=0.452138;y_dep[2417]=0.452612;y_dep[2418]=0.453086;y_dep[2419]=0.453559;
+        y_dep[2420]=0.454032;y_dep[2421]=0.454504;y_dep[2422]=0.454976;y_dep[2423]=0.455448;y_dep[2424]=0.455918;
+        y_dep[2425]=0.456388;y_dep[2426]=0.456858;y_dep[2427]=0.457326;y_dep[2428]=0.457793;y_dep[2429]=0.45826;
+        y_dep[2430]=0.458726;y_dep[2431]=0.45919;y_dep[2432]=0.459654;y_dep[2433]=0.460117;y_dep[2434]=0.460579;
+        y_dep[2435]=0.46104;y_dep[2436]=0.4615;y_dep[2437]=0.461959;y_dep[2438]=0.462418;y_dep[2439]=0.462875;
+        y_dep[2440]=0.463332;y_dep[2441]=0.463788;y_dep[2442]=0.464243;y_dep[2443]=0.464698;y_dep[2444]=0.465153;
+        y_dep[2445]=0.465607;y_dep[2446]=0.46606;y_dep[2447]=0.466513;y_dep[2448]=0.466966;y_dep[2449]=0.467419;
+        y_dep[2450]=0.467872;y_dep[2451]=0.468325;y_dep[2452]=0.468778;y_dep[2453]=0.469231;y_dep[2454]=0.469685;
+        y_dep[2455]=0.470139;y_dep[2456]=0.470593;y_dep[2457]=0.471048;y_dep[2458]=0.471503;y_dep[2459]=0.471959;
+        y_dep[2460]=0.472416;y_dep[2461]=0.472874;y_dep[2462]=0.473332;y_dep[2463]=0.473791;y_dep[2464]=0.474251;
+        y_dep[2465]=0.474712;y_dep[2466]=0.475174;y_dep[2467]=0.475636;y_dep[2468]=0.4761;y_dep[2469]=0.476565;
+        y_dep[2470]=0.47703;y_dep[2471]=0.477497;y_dep[2472]=0.477964;y_dep[2473]=0.478433;y_dep[2474]=0.478902;
+        y_dep[2475]=0.479372;y_dep[2476]=0.479842;y_dep[2477]=0.480314;y_dep[2478]=0.480786;y_dep[2479]=0.481258;
+        y_dep[2480]=0.481731;y_dep[2481]=0.482205;y_dep[2482]=0.482678;y_dep[2483]=0.483152;y_dep[2484]=0.483626;
+        y_dep[2485]=0.4841;y_dep[2486]=0.484574;y_dep[2487]=0.485048;y_dep[2488]=0.485522;y_dep[2489]=0.485995;
+        y_dep[2490]=0.486468;y_dep[2491]=0.486941;y_dep[2492]=0.487413;y_dep[2493]=0.487884;y_dep[2494]=0.488355;
+        y_dep[2495]=0.488824;y_dep[2496]=0.489294;y_dep[2497]=0.489762;y_dep[2498]=0.490229;y_dep[2499]=0.490696;
+        y_dep[2500]=0.491161;y_dep[2501]=0.491626;y_dep[2502]=0.492089;y_dep[2503]=0.492552;y_dep[2504]=0.493014;
+        y_dep[2505]=0.493475;y_dep[2506]=0.493935;y_dep[2507]=0.494394;y_dep[2508]=0.494852;y_dep[2509]=0.495309;
+        y_dep[2510]=0.495766;y_dep[2511]=0.496222;y_dep[2512]=0.496677;y_dep[2513]=0.497132;y_dep[2514]=0.497587;
+        y_dep[2515]=0.49804;y_dep[2516]=0.498494;y_dep[2517]=0.498947;y_dep[2518]=0.4994;y_dep[2519]=0.499853;
+        y_dep[2520]=0.500306;y_dep[2521]=0.500759;y_dep[2522]=0.501212;y_dep[2523]=0.501666;y_dep[2524]=0.502119;
+        y_dep[2525]=0.502573;y_dep[2526]=0.503028;y_dep[2527]=0.503483;y_dep[2528]=0.503939;y_dep[2529]=0.504395;
+        y_dep[2530]=0.504852;y_dep[2531]=0.505309;y_dep[2532]=0.505768;y_dep[2533]=0.506227;y_dep[2534]=0.506688;
+        y_dep[2535]=0.507149;y_dep[2536]=0.507611;y_dep[2537]=0.508074;y_dep[2538]=0.508538;y_dep[2539]=0.509003;
+        y_dep[2540]=0.509469;y_dep[2541]=0.509935;y_dep[2542]=0.510403;y_dep[2543]=0.510872;y_dep[2544]=0.511341;
+        y_dep[2545]=0.511811;y_dep[2546]=0.512282;y_dep[2547]=0.512754;y_dep[2548]=0.513226;y_dep[2549]=0.513698;
+        y_dep[2550]=0.514171;y_dep[2551]=0.514645;y_dep[2552]=0.515119;y_dep[2553]=0.515593;y_dep[2554]=0.516067;
+        y_dep[2555]=0.516541;y_dep[2556]=0.517015;y_dep[2557]=0.517489;y_dep[2558]=0.517962;y_dep[2559]=0.518435;
+        y_dep[2560]=0.518908;y_dep[2561]=0.519381;y_dep[2562]=0.519852;y_dep[2563]=0.520324;y_dep[2564]=0.520794;
+        y_dep[2565]=0.521264;y_dep[2566]=0.521732;y_dep[2567]=0.5222;y_dep[2568]=0.522668;y_dep[2569]=0.523134;
+        y_dep[2570]=0.523599;y_dep[2571]=0.524063;y_dep[2572]=0.524527;y_dep[2573]=0.524989;y_dep[2574]=0.525451;
+        y_dep[2575]=0.525911;y_dep[2576]=0.526371;y_dep[2577]=0.52683;y_dep[2578]=0.527288;y_dep[2579]=0.527745;
+        y_dep[2580]=0.528201;y_dep[2581]=0.528657;y_dep[2582]=0.529112;y_dep[2583]=0.529567;y_dep[2584]=0.530021;
+        y_dep[2585]=0.530475;y_dep[2586]=0.530928;y_dep[2587]=0.531381;y_dep[2588]=0.531834;y_dep[2589]=0.532287;
+        y_dep[2590]=0.53274;y_dep[2591]=0.533193;y_dep[2592]=0.533646;y_dep[2593]=0.5341;y_dep[2594]=0.534553;
+        y_dep[2595]=0.535007;y_dep[2596]=0.535462;y_dep[2597]=0.535917;y_dep[2598]=0.536373;y_dep[2599]=0.536829;
+        y_dep[2600]=0.537286;y_dep[2601]=0.537744;y_dep[2602]=0.538202;y_dep[2603]=0.538662;y_dep[2604]=0.539122;
+        y_dep[2605]=0.539584;y_dep[2606]=0.540046;y_dep[2607]=0.540509;y_dep[2608]=0.540973;y_dep[2609]=0.541438;
+        y_dep[2610]=0.541904;y_dep[2611]=0.542371;y_dep[2612]=0.542839;y_dep[2613]=0.543308;y_dep[2614]=0.543777;
+        y_dep[2615]=0.544247;y_dep[2616]=0.544718;y_dep[2617]=0.54519;y_dep[2618]=0.545662;y_dep[2619]=0.546135;
+        y_dep[2620]=0.546608;y_dep[2621]=0.547081;y_dep[2622]=0.547555;y_dep[2623]=0.548029;y_dep[2624]=0.548503;
+        y_dep[2625]=0.548977;y_dep[2626]=0.54945;y_dep[2627]=0.549924;y_dep[2628]=0.550397;y_dep[2629]=0.55087;
+        y_dep[2630]=0.551343;y_dep[2631]=0.551815;y_dep[2632]=0.552287;y_dep[2633]=0.552757;y_dep[2634]=0.553227;
+        y_dep[2635]=0.553697;y_dep[2636]=0.554165;y_dep[2637]=0.554633;y_dep[2638]=0.5551;y_dep[2639]=0.555565;
+        y_dep[2640]=0.55603;y_dep[2641]=0.556494;y_dep[2642]=0.556957;y_dep[2643]=0.557419;y_dep[2644]=0.55788;
+        y_dep[2645]=0.55834;y_dep[2646]=0.5588;y_dep[2647]=0.559258;y_dep[2648]=0.559716;y_dep[2649]=0.560173;
+        y_dep[2650]=0.560629;y_dep[2651]=0.561084;y_dep[2652]=0.561539;y_dep[2653]=0.561993;y_dep[2654]=0.562447;
+        y_dep[2655]=0.562901;y_dep[2656]=0.563354;y_dep[2657]=0.563807;y_dep[2658]=0.564259;y_dep[2659]=0.564712;
+        y_dep[2660]=0.565165;y_dep[2661]=0.565618;y_dep[2662]=0.566071;y_dep[2663]=0.566524;y_dep[2664]=0.566977;
+        y_dep[2665]=0.567431;y_dep[2666]=0.567886;y_dep[2667]=0.568341;y_dep[2668]=0.568796;y_dep[2669]=0.569253;
+        y_dep[2670]=0.56971;y_dep[2671]=0.570167;y_dep[2672]=0.570626;y_dep[2673]=0.571086;y_dep[2674]=0.571546;
+        y_dep[2675]=0.572007;y_dep[2676]=0.57247;y_dep[2677]=0.572933;y_dep[2678]=0.573397;y_dep[2679]=0.573862;
+        y_dep[2680]=0.574328;y_dep[2681]=0.574795;y_dep[2682]=0.575263;y_dep[2683]=0.575731;y_dep[2684]=0.576201;
+        y_dep[2685]=0.576671;y_dep[2686]=0.577142;y_dep[2687]=0.577613;y_dep[2688]=0.578085;y_dep[2689]=0.578558;
+        y_dep[2690]=0.579031;y_dep[2691]=0.579504;y_dep[2692]=0.579977;y_dep[2693]=0.580451;y_dep[2694]=0.580925;
+        y_dep[2695]=0.581398;y_dep[2696]=0.581872;y_dep[2697]=0.582345;y_dep[2698]=0.582818;y_dep[2699]=0.583291;
+        y_dep[2700]=0.583763;y_dep[2701]=0.584235;y_dep[2702]=0.584706;y_dep[2703]=0.585176;y_dep[2704]=0.585646;
+        y_dep[2705]=0.586114;y_dep[2706]=0.586582;y_dep[2707]=0.58705;y_dep[2708]=0.587516;y_dep[2709]=0.587981;
+        y_dep[2710]=0.588445;y_dep[2711]=0.588909;y_dep[2712]=0.589371;y_dep[2713]=0.589833;y_dep[2714]=0.590293;
+        y_dep[2715]=0.590753;y_dep[2716]=0.591212;y_dep[2717]=0.591669;y_dep[2718]=0.592127;y_dep[2719]=0.592583;
+        y_dep[2720]=0.593038;y_dep[2721]=0.593493;y_dep[2722]=0.593948;y_dep[2723]=0.594402;y_dep[2724]=0.594855;
+        y_dep[2725]=0.595308;y_dep[2726]=0.595761;y_dep[2727]=0.596213;y_dep[2728]=0.596666;y_dep[2729]=0.597118;
+        y_dep[2730]=0.597571;y_dep[2731]=0.598023;y_dep[2732]=0.598476;y_dep[2733]=0.598929;y_dep[2734]=0.599382;
+        y_dep[2735]=0.599836;y_dep[2736]=0.60029;y_dep[2737]=0.600745;y_dep[2738]=0.6012;y_dep[2739]=0.601656;
+        y_dep[2740]=0.602113;y_dep[2741]=0.602571;y_dep[2742]=0.603029;y_dep[2743]=0.603489;y_dep[2744]=0.603949;
+        y_dep[2745]=0.60441;y_dep[2746]=0.604872;y_dep[2747]=0.605335;y_dep[2748]=0.605799;y_dep[2749]=0.606264;
+        y_dep[2750]=0.60673;y_dep[2751]=0.607197;y_dep[2752]=0.607664;y_dep[2753]=0.608133;y_dep[2754]=0.608602;
+        y_dep[2755]=0.609072;y_dep[2756]=0.609542;y_dep[2757]=0.610014;y_dep[2758]=0.610485;y_dep[2759]=0.610958;
+        y_dep[2760]=0.61143;y_dep[2761]=0.611903;y_dep[2762]=0.612376;y_dep[2763]=0.61285;y_dep[2764]=0.613323;
+        y_dep[2765]=0.613796;y_dep[2766]=0.614269;y_dep[2767]=0.614742;y_dep[2768]=0.615214;y_dep[2769]=0.615686;
+        y_dep[2770]=0.616158;y_dep[2771]=0.616629;y_dep[2772]=0.6171;y_dep[2773]=0.617569;y_dep[2774]=0.618038;
+        y_dep[2775]=0.618506;y_dep[2776]=0.618974;y_dep[2777]=0.61944;y_dep[2778]=0.619906;y_dep[2779]=0.62037;
+        y_dep[2780]=0.620834;y_dep[2781]=0.621297;y_dep[2782]=0.621758;y_dep[2783]=0.622219;y_dep[2784]=0.622679;
+        y_dep[2785]=0.623138;y_dep[2786]=0.623596;y_dep[2787]=0.624053;y_dep[2788]=0.624509;y_dep[2789]=0.624965;
+        y_dep[2790]=0.62542;y_dep[2791]=0.625874;y_dep[2792]=0.626328;y_dep[2793]=0.626781;y_dep[2794]=0.627234;
+        y_dep[2795]=0.627687;y_dep[2796]=0.628139;y_dep[2797]=0.628591;y_dep[2798]=0.629043;y_dep[2799]=0.629495;
+        y_dep[2800]=0.629947;y_dep[2801]=0.630399;y_dep[2802]=0.630851;y_dep[2803]=0.631303;y_dep[2804]=0.631756;
+        y_dep[2805]=0.632209;y_dep[2806]=0.632663;y_dep[2807]=0.633118;y_dep[2808]=0.633573;y_dep[2809]=0.634029;
+        y_dep[2810]=0.634485;y_dep[2811]=0.634942;y_dep[2812]=0.635401;y_dep[2813]=0.63586;y_dep[2814]=0.63632;
+        y_dep[2815]=0.63678;y_dep[2816]=0.637242;y_dep[2817]=0.637705;y_dep[2818]=0.638169;y_dep[2819]=0.638633;
+        y_dep[2820]=0.639099;y_dep[2821]=0.639565;y_dep[2822]=0.640032;y_dep[2823]=0.6405;y_dep[2824]=0.640969;
+        y_dep[2825]=0.641439;y_dep[2826]=0.641909;y_dep[2827]=0.64238;y_dep[2828]=0.642851;y_dep[2829]=0.643323;
+        y_dep[2830]=0.643795;y_dep[2831]=0.644267;y_dep[2832]=0.64474;y_dep[2833]=0.645213;y_dep[2834]=0.645685;
+        y_dep[2835]=0.646158;y_dep[2836]=0.64663;y_dep[2837]=0.647102;y_dep[2838]=0.647574;y_dep[2839]=0.648046;
+        y_dep[2840]=0.648516;y_dep[2841]=0.648987;y_dep[2842]=0.649456;y_dep[2843]=0.649925;y_dep[2844]=0.650393;
+        y_dep[2845]=0.650861;y_dep[2846]=0.651327;y_dep[2847]=0.651793;y_dep[2848]=0.652257;y_dep[2849]=0.652721;
+        y_dep[2850]=0.653184;y_dep[2851]=0.653646;y_dep[2852]=0.654107;y_dep[2853]=0.654566;y_dep[2854]=0.655025;
+        y_dep[2855]=0.655483;y_dep[2856]=0.655941;y_dep[2857]=0.656397;y_dep[2858]=0.656852;y_dep[2859]=0.657307;
+        y_dep[2860]=0.657761;y_dep[2861]=0.658215;y_dep[2862]=0.658668;y_dep[2863]=0.65912;y_dep[2864]=0.659572;
+        y_dep[2865]=0.660024;y_dep[2866]=0.660475;y_dep[2867]=0.660927;y_dep[2868]=0.661378;y_dep[2869]=0.661829;
+        y_dep[2870]=0.66228;y_dep[2871]=0.662732;y_dep[2872]=0.663183;y_dep[2873]=0.663635;y_dep[2874]=0.664087;
+        y_dep[2875]=0.66454;y_dep[2876]=0.664993;y_dep[2877]=0.665447;y_dep[2878]=0.665902;y_dep[2879]=0.666357;
+        y_dep[2880]=0.666813;y_dep[2881]=0.66727;y_dep[2882]=0.667727;y_dep[2883]=0.668186;y_dep[2884]=0.668645;
+        y_dep[2885]=0.669106;y_dep[2886]=0.669567;y_dep[2887]=0.670029;y_dep[2888]=0.670492;y_dep[2889]=0.670956;
+        y_dep[2890]=0.671421;y_dep[2891]=0.671887;y_dep[2892]=0.672354;y_dep[2893]=0.672821;y_dep[2894]=0.67329;
+        y_dep[2895]=0.673759;y_dep[2896]=0.674228;y_dep[2897]=0.674698;y_dep[2898]=0.675169;y_dep[2899]=0.67564;
+        y_dep[2900]=0.676111;y_dep[2901]=0.676583;y_dep[2902]=0.677055;y_dep[2903]=0.677527;y_dep[2904]=0.677998;
+        y_dep[2905]=0.67847;y_dep[2906]=0.678942;y_dep[2907]=0.679413;y_dep[2908]=0.679884;y_dep[2909]=0.680354;
+        y_dep[2910]=0.680824;y_dep[2911]=0.681293;y_dep[2912]=0.681762;y_dep[2913]=0.68223;y_dep[2914]=0.682697;
+        y_dep[2915]=0.683163;y_dep[2916]=0.683629;y_dep[2917]=0.684093;y_dep[2918]=0.684557;y_dep[2919]=0.685019;
+        y_dep[2920]=0.685481;y_dep[2921]=0.685942;y_dep[2922]=0.686401;y_dep[2923]=0.68686;y_dep[2924]=0.687318;
+        y_dep[2925]=0.687775;y_dep[2926]=0.688231;y_dep[2927]=0.688686;y_dep[2928]=0.68914;y_dep[2929]=0.689594;
+        y_dep[2930]=0.690047;y_dep[2931]=0.6905;y_dep[2932]=0.690952;y_dep[2933]=0.691403;y_dep[2934]=0.691854;
+        y_dep[2935]=0.692305;y_dep[2936]=0.692755;y_dep[2937]=0.693205;y_dep[2938]=0.693656;y_dep[2939]=0.694106;
+        y_dep[2940]=0.694556;y_dep[2941]=0.695007;y_dep[2942]=0.695457;y_dep[2943]=0.695908;y_dep[2944]=0.69636;
+        y_dep[2945]=0.696812;y_dep[2946]=0.697264;y_dep[2947]=0.697717;y_dep[2948]=0.698171;y_dep[2949]=0.698625;
+        y_dep[2950]=0.69908;y_dep[2951]=0.699536;y_dep[2952]=0.699993;y_dep[2953]=0.700451;y_dep[2954]=0.70091;
+        y_dep[2955]=0.701369;y_dep[2956]=0.70183;y_dep[2957]=0.702291;y_dep[2958]=0.702754;y_dep[2959]=0.703217;
+        y_dep[2960]=0.703681;y_dep[2961]=0.704146;y_dep[2962]=0.704612;y_dep[2963]=0.705079;y_dep[2964]=0.705546;
+        y_dep[2965]=0.706014;y_dep[2966]=0.706483;y_dep[2967]=0.706952;y_dep[2968]=0.707422;y_dep[2969]=0.707892;
+        y_dep[2970]=0.708362;y_dep[2971]=0.708833;y_dep[2972]=0.709303;y_dep[2973]=0.709774;y_dep[2974]=0.710245;
+        y_dep[2975]=0.710715;y_dep[2976]=0.711186;y_dep[2977]=0.711656;y_dep[2978]=0.712125;y_dep[2979]=0.712595;
+        y_dep[2980]=0.713063;y_dep[2981]=0.713531;y_dep[2982]=0.713998;y_dep[2983]=0.714465;y_dep[2984]=0.714931;
+        y_dep[2985]=0.715396;y_dep[2986]=0.71586;y_dep[2987]=0.716323;y_dep[2988]=0.716785;y_dep[2989]=0.717246;
+        y_dep[2990]=0.717706;y_dep[2991]=0.718166;y_dep[2992]=0.718624;y_dep[2993]=0.719081;y_dep[2994]=0.719538;
+        y_dep[2995]=0.719993;y_dep[2996]=0.720448;y_dep[2997]=0.720902;y_dep[2998]=0.721355;y_dep[2999]=0.721807;
+        y_dep[3000]=0.722259;y_dep[3001]=0.72271;y_dep[3002]=0.72316;y_dep[3003]=0.72361;y_dep[3004]=0.72406;
+        y_dep[3005]=0.724509;y_dep[3006]=0.724958;y_dep[3007]=0.725407;y_dep[3008]=0.725856;y_dep[3009]=0.726305;
+        y_dep[3010]=0.726754;y_dep[3011]=0.727204;y_dep[3012]=0.727653;y_dep[3013]=0.728103;y_dep[3014]=0.728553;
+        y_dep[3015]=0.729004;y_dep[3016]=0.729455;y_dep[3017]=0.729907;y_dep[3018]=0.73036;y_dep[3019]=0.730813;
+        y_dep[3020]=0.731267;y_dep[3021]=0.731722;y_dep[3022]=0.732178;y_dep[3023]=0.732634;y_dep[3024]=0.733092;
+        y_dep[3025]=0.73355;y_dep[3026]=0.73401;y_dep[3027]=0.73447;y_dep[3028]=0.734931;y_dep[3029]=0.735393;
+        y_dep[3030]=0.735856;y_dep[3031]=0.73632;y_dep[3032]=0.736785;y_dep[3033]=0.73725;y_dep[3034]=0.737716;
+        y_dep[3035]=0.738183;y_dep[3036]=0.738651;y_dep[3037]=0.739119;y_dep[3038]=0.739587;y_dep[3039]=0.740056;
+        y_dep[3040]=0.740525;y_dep[3041]=0.740994;y_dep[3042]=0.741463;y_dep[3043]=0.741932;y_dep[3044]=0.742402;
+        y_dep[3045]=0.742871;y_dep[3046]=0.743339;y_dep[3047]=0.743808;y_dep[3048]=0.744276;y_dep[3049]=0.744743;
+        y_dep[3050]=0.74521;y_dep[3051]=0.745677;y_dep[3052]=0.746142;y_dep[3053]=0.746607;y_dep[3054]=0.747071;
+        y_dep[3055]=0.747534;y_dep[3056]=0.747996;y_dep[3057]=0.748458;y_dep[3058]=0.748918;y_dep[3059]=0.749377;
+        y_dep[3060]=0.749836;y_dep[3061]=0.750293;y_dep[3062]=0.75075;y_dep[3063]=0.751205;y_dep[3064]=0.75166;
+        y_dep[3065]=0.752113;y_dep[3066]=0.752566;y_dep[3067]=0.753018;y_dep[3068]=0.753469;y_dep[3069]=0.75392;
+        y_dep[3070]=0.75437;y_dep[3071]=0.754819;y_dep[3072]=0.755268;y_dep[3073]=0.755716;y_dep[3074]=0.756164;
+        y_dep[3075]=0.756612;y_dep[3076]=0.757059;y_dep[3077]=0.757506;y_dep[3078]=0.757954;y_dep[3079]=0.758401;
+        y_dep[3080]=0.758848;y_dep[3081]=0.759296;y_dep[3082]=0.759744;y_dep[3083]=0.760192;y_dep[3084]=0.76064;
+        y_dep[3085]=0.76109;y_dep[3086]=0.761539;y_dep[3087]=0.761989;y_dep[3088]=0.76244;y_dep[3089]=0.762892;
+        y_dep[3090]=0.763345;y_dep[3091]=0.763798;y_dep[3092]=0.764252;y_dep[3093]=0.764707;y_dep[3094]=0.765163;
+        y_dep[3095]=0.76562;y_dep[3096]=0.766078;y_dep[3097]=0.766536;y_dep[3098]=0.766996;y_dep[3099]=0.767456;
+        y_dep[3100]=0.767918;y_dep[3101]=0.76838;y_dep[3102]=0.768843;y_dep[3103]=0.769307;y_dep[3104]=0.769771;
+        y_dep[3105]=0.770236;y_dep[3106]=0.770702;y_dep[3107]=0.771168;y_dep[3108]=0.771634;y_dep[3109]=0.772101;
+        y_dep[3110]=0.772568;y_dep[3111]=0.773035;y_dep[3112]=0.773503;y_dep[3113]=0.77397;y_dep[3114]=0.774437;
+        y_dep[3115]=0.774904;y_dep[3116]=0.775371;y_dep[3117]=0.775837;y_dep[3118]=0.776303;y_dep[3119]=0.776768;
+        y_dep[3120]=0.777233;y_dep[3121]=0.777697;y_dep[3122]=0.77816;y_dep[3123]=0.778623;y_dep[3124]=0.779085;
+        y_dep[3125]=0.779545;y_dep[3126]=0.780005;y_dep[3127]=0.780464;y_dep[3128]=0.780922;y_dep[3129]=0.781379;
+        y_dep[3130]=0.781835;y_dep[3131]=0.78229;y_dep[3132]=0.782744;y_dep[3133]=0.783197;y_dep[3134]=0.783649;
+        y_dep[3135]=0.7841;y_dep[3136]=0.784551;y_dep[3137]=0.785;y_dep[3138]=0.785449;y_dep[3139]=0.785897;
+        y_dep[3140]=0.786345;y_dep[3141]=0.786791;y_dep[3142]=0.787238;y_dep[3143]=0.787684;y_dep[3144]=0.788129;
+        y_dep[3145]=0.788574;y_dep[3146]=0.78902;y_dep[3147]=0.789464;y_dep[3148]=0.789909;y_dep[3149]=0.790354;
+        y_dep[3150]=0.790799;y_dep[3151]=0.791244;y_dep[3152]=0.79169;y_dep[3153]=0.792136;y_dep[3154]=0.792582;
+        y_dep[3155]=0.793029;y_dep[3156]=0.793476;y_dep[3157]=0.793924;y_dep[3158]=0.794373;y_dep[3159]=0.794822;
+        y_dep[3160]=0.795272;y_dep[3161]=0.795723;y_dep[3162]=0.796175;y_dep[3163]=0.796628;y_dep[3164]=0.797082;
+        y_dep[3165]=0.797536;y_dep[3166]=0.797992;y_dep[3167]=0.798448;y_dep[3168]=0.798905;y_dep[3169]=0.799363;
+        y_dep[3170]=0.799822;y_dep[3171]=0.800282;y_dep[3172]=0.800742;y_dep[3173]=0.801204;y_dep[3174]=0.801666;
+        y_dep[3175]=0.802128;y_dep[3176]=0.802591;y_dep[3177]=0.803055;y_dep[3178]=0.803518;y_dep[3179]=0.803983;
+        y_dep[3180]=0.804447;y_dep[3181]=0.804911;y_dep[3182]=0.805376;y_dep[3183]=0.80584;y_dep[3184]=0.806305;
+        y_dep[3185]=0.806769;y_dep[3186]=0.807232;y_dep[3187]=0.807696;y_dep[3188]=0.808159;y_dep[3189]=0.808621;
+        y_dep[3190]=0.809083;y_dep[3191]=0.809544;y_dep[3192]=0.810004;y_dep[3193]=0.810463;y_dep[3194]=0.810922;
+        y_dep[3195]=0.811379;y_dep[3196]=0.811836;y_dep[3197]=0.812291;y_dep[3198]=0.812746;y_dep[3199]=0.8132;
+        y_dep[3200]=0.813652;y_dep[3201]=0.814104;y_dep[3202]=0.814555;y_dep[3203]=0.815005;y_dep[3204]=0.815453;
+        y_dep[3205]=0.815901;y_dep[3206]=0.816348;y_dep[3207]=0.816794;y_dep[3208]=0.81724;y_dep[3209]=0.817684;
+        y_dep[3210]=0.818128;y_dep[3211]=0.818572;y_dep[3212]=0.819015;y_dep[3213]=0.819457;y_dep[3214]=0.819899;
+        y_dep[3215]=0.820341;y_dep[3216]=0.820783;y_dep[3217]=0.821225;y_dep[3218]=0.821666;y_dep[3219]=0.822108;
+        y_dep[3220]=0.822549;y_dep[3221]=0.822991;y_dep[3222]=0.823433;y_dep[3223]=0.823876;y_dep[3224]=0.824319;
+        y_dep[3225]=0.824762;y_dep[3226]=0.825206;y_dep[3227]=0.825651;y_dep[3228]=0.826096;y_dep[3229]=0.826542;
+        y_dep[3230]=0.826989;y_dep[3231]=0.827436;y_dep[3232]=0.827885;y_dep[3233]=0.828334;y_dep[3234]=0.828784;
+        y_dep[3235]=0.829235;y_dep[3236]=0.829687;y_dep[3237]=0.83014;y_dep[3238]=0.830594;y_dep[3239]=0.831048;
+        y_dep[3240]=0.831503;y_dep[3241]=0.831959;y_dep[3242]=0.832416;y_dep[3243]=0.832874;y_dep[3244]=0.833332;
+        y_dep[3245]=0.833791;y_dep[3246]=0.83425;y_dep[3247]=0.834709;y_dep[3248]=0.835169;y_dep[3249]=0.83563;
+        y_dep[3250]=0.83609;y_dep[3251]=0.83655;y_dep[3252]=0.837011;y_dep[3253]=0.837471;y_dep[3254]=0.837931;
+        y_dep[3255]=0.838391;y_dep[3256]=0.83885;y_dep[3257]=0.839309;y_dep[3258]=0.839768;y_dep[3259]=0.840226;
+        y_dep[3260]=0.840683;y_dep[3261]=0.841139;y_dep[3262]=0.841595;y_dep[3263]=0.84205;y_dep[3264]=0.842504;
+        y_dep[3265]=0.842957;y_dep[3266]=0.843409;y_dep[3267]=0.843859;y_dep[3268]=0.844309;y_dep[3269]=0.844758;
+        y_dep[3270]=0.845206;y_dep[3271]=0.845653;y_dep[3272]=0.846099;y_dep[3273]=0.846543;y_dep[3274]=0.846987;
+        y_dep[3275]=0.84743;y_dep[3276]=0.847872;y_dep[3277]=0.848313;y_dep[3278]=0.848754;y_dep[3279]=0.849194;
+        y_dep[3280]=0.849633;y_dep[3281]=0.850071;y_dep[3282]=0.850509;y_dep[3283]=0.850946;y_dep[3284]=0.851383;
+        y_dep[3285]=0.85182;y_dep[3286]=0.852257;y_dep[3287]=0.852693;y_dep[3288]=0.85313;y_dep[3289]=0.853566;
+        y_dep[3290]=0.854003;y_dep[3291]=0.854439;y_dep[3292]=0.854876;y_dep[3293]=0.855314;y_dep[3294]=0.855751;
+        y_dep[3295]=0.856189;y_dep[3296]=0.856628;y_dep[3297]=0.857068;y_dep[3298]=0.857508;y_dep[3299]=0.857948;
+        y_dep[3300]=0.85839;y_dep[3301]=0.858832;y_dep[3302]=0.859275;y_dep[3303]=0.859719;y_dep[3304]=0.860163;
+        y_dep[3305]=0.860609;y_dep[3306]=0.861055;y_dep[3307]=0.861503;y_dep[3308]=0.861951;y_dep[3309]=0.862399;
+        y_dep[3310]=0.862849;y_dep[3311]=0.863299;y_dep[3312]=0.86375;y_dep[3313]=0.864202;y_dep[3314]=0.864654;
+        y_dep[3315]=0.865107;y_dep[3316]=0.86556;y_dep[3317]=0.866013;y_dep[3318]=0.866467;y_dep[3319]=0.866921;
+        y_dep[3320]=0.867375;y_dep[3321]=0.867829;y_dep[3322]=0.868283;y_dep[3323]=0.868737;y_dep[3324]=0.86919;
+        y_dep[3325]=0.869644;y_dep[3326]=0.870096;y_dep[3327]=0.870548;y_dep[3328]=0.871;y_dep[3329]=0.871451;
+        y_dep[3330]=0.871901;y_dep[3331]=0.872351;y_dep[3332]=0.872799;y_dep[3333]=0.873247;y_dep[3334]=0.873693;
+        y_dep[3335]=0.874139;y_dep[3336]=0.874583;y_dep[3337]=0.875027;y_dep[3338]=0.875469;y_dep[3339]=0.87591;
+        y_dep[3340]=0.876351;y_dep[3341]=0.87679;y_dep[3342]=0.877228;y_dep[3343]=0.877665;y_dep[3344]=0.878101;
+        y_dep[3345]=0.878536;y_dep[3346]=0.87897;y_dep[3347]=0.879403;y_dep[3348]=0.879836;y_dep[3349]=0.880267;
+        y_dep[3350]=0.880698;y_dep[3351]=0.881129;y_dep[3352]=0.881558;y_dep[3353]=0.881987;y_dep[3354]=0.882416;
+        y_dep[3355]=0.882845;y_dep[3356]=0.883273;y_dep[3357]=0.883701;y_dep[3358]=0.884129;y_dep[3359]=0.884557;
+        y_dep[3360]=0.884985;y_dep[3361]=0.885413;y_dep[3362]=0.885841;y_dep[3363]=0.88627;y_dep[3364]=0.886699;
+        y_dep[3365]=0.887128;y_dep[3366]=0.887558;y_dep[3367]=0.887988;y_dep[3368]=0.888419;y_dep[3369]=0.888851;
+        y_dep[3370]=0.889283;y_dep[3371]=0.889716;y_dep[3372]=0.89015;y_dep[3373]=0.890584;y_dep[3374]=0.891019;
+        y_dep[3375]=0.891455;y_dep[3376]=0.891892;y_dep[3377]=0.89233;y_dep[3378]=0.892768;y_dep[3379]=0.893207;
+        y_dep[3380]=0.893646;y_dep[3381]=0.894087;y_dep[3382]=0.894527;y_dep[3383]=0.894969;y_dep[3384]=0.89541;
+        y_dep[3385]=0.895853;y_dep[3386]=0.896295;y_dep[3387]=0.896738;y_dep[3388]=0.897181;y_dep[3389]=0.897623;
+        y_dep[3390]=0.898066;y_dep[3391]=0.898509;y_dep[3392]=0.898952;y_dep[3393]=0.899394;y_dep[3394]=0.899836;
+        y_dep[3395]=0.900277;y_dep[3396]=0.900718;y_dep[3397]=0.901158;y_dep[3398]=0.901598;y_dep[3399]=0.902036;
+        y_dep[3400]=0.902474;
+
+        // Table: d2d_mismatch_quantile.pwl (103 points)
+        x_d2d[0]=0;y_d2d[0]=-0.82325746;x_d2d[1]=0.001;y_d2d[1]=-0.82325746;x_d2d[2]=0.01098;y_d2d[2]=-0.33816369;
+        x_d2d[3]=0.02096;y_d2d[3]=-0.20036161;x_d2d[4]=0.03094;y_d2d[4]=-0.14480194;x_d2d[5]=0.04092;y_d2d[5]=-0.1088375;
+        x_d2d[6]=0.0509;y_d2d[6]=-0.082511855;x_d2d[7]=0.06088;y_d2d[7]=-0.06209299;x_d2d[8]=0.07086;y_d2d[8]=-0.043423015;
+        x_d2d[9]=0.08084;y_d2d[9]=-0.028198315;x_d2d[10]=0.09082;y_d2d[10]=-0.013063635;x_d2d[11]=0.1008;y_d2d[11]=-0.00036408348;
+        x_d2d[12]=0.11078;y_d2d[12]=-0.00024390005;x_d2d[13]=0.12076;y_d2d[13]=-0.00019475716;x_d2d[14]=0.13074;y_d2d[14]=-0.00016236835;
+        x_d2d[15]=0.14072;y_d2d[15]=-0.0001411978;x_d2d[16]=0.1507;y_d2d[16]=-0.00012526604;x_d2d[17]=0.16068;y_d2d[17]=-0.0001130721;
+        x_d2d[18]=0.17066;y_d2d[18]=-0.00010237728;x_d2d[19]=0.18064;y_d2d[19]=-9.4114699e-05;x_d2d[20]=0.19062;y_d2d[20]=-8.6857392e-05;
+        x_d2d[21]=0.2006;y_d2d[21]=-8.0749208e-05;x_d2d[22]=0.21058;y_d2d[22]=-7.5174292e-05;x_d2d[23]=0.22056;y_d2d[23]=-7.0284888e-05;
+        x_d2d[24]=0.23054;y_d2d[24]=-6.5746958e-05;x_d2d[25]=0.24052;y_d2d[25]=-6.1911022e-05;x_d2d[26]=0.2505;y_d2d[26]=-5.8136828e-05;
+        x_d2d[27]=0.26048;y_d2d[27]=-5.4458278e-05;x_d2d[28]=0.27046;y_d2d[28]=-5.1214352e-05;x_d2d[29]=0.28044;y_d2d[29]=-4.8191098e-05;
+        x_d2d[30]=0.29042;y_d2d[30]=-4.5179172e-05;x_d2d[31]=0.3004;y_d2d[31]=-4.2335469e-05;x_d2d[32]=0.31038;y_d2d[32]=-3.9687217e-05;
+        x_d2d[33]=0.32036;y_d2d[33]=-3.7175065e-05;x_d2d[34]=0.33034;y_d2d[34]=-3.4696064e-05;x_d2d[35]=0.34032;y_d2d[35]=-3.2222683e-05;
+        x_d2d[36]=0.3503;y_d2d[36]=-2.9864925e-05;x_d2d[37]=0.36028;y_d2d[37]=-2.7648453e-05;x_d2d[38]=0.37026;y_d2d[38]=-2.5354533e-05;
+        x_d2d[39]=0.38024;y_d2d[39]=-2.3183755e-05;x_d2d[40]=0.39022;y_d2d[40]=-2.1033931e-05;x_d2d[41]=0.4002;y_d2d[41]=-1.9040042e-05;
+        x_d2d[42]=0.41018;y_d2d[42]=-1.7039277e-05;x_d2d[43]=0.42016;y_d2d[43]=-1.4943734e-05;x_d2d[44]=0.43014;y_d2d[44]=-1.2985224e-05;
+        x_d2d[45]=0.44012;y_d2d[45]=-1.0987299e-05;x_d2d[46]=0.4501;y_d2d[46]=-9.0115699e-06;x_d2d[47]=0.46008;y_d2d[47]=-7.1647619e-06;
+        x_d2d[48]=0.47006;y_d2d[48]=-5.2147948e-06;x_d2d[49]=0.48004;y_d2d[49]=-3.3253074e-06;x_d2d[50]=0.49002;y_d2d[50]=-1.5068512e-06;
+        x_d2d[51]=0.5;y_d2d[51]=3.228489e-07;x_d2d[52]=0.50998;y_d2d[52]=2.064267e-06;x_d2d[53]=0.51996;y_d2d[53]=3.9082045e-06;
+        x_d2d[54]=0.52994;y_d2d[54]=5.7200527e-06;x_d2d[55]=0.53992;y_d2d[55]=7.6282801e-06;x_d2d[56]=0.5499;y_d2d[56]=9.5280237e-06;
+        x_d2d[57]=0.55988;y_d2d[57]=1.1297797e-05;x_d2d[58]=0.56986;y_d2d[58]=1.3195013e-05;x_d2d[59]=0.57984;y_d2d[59]=1.5104666e-05;
+        x_d2d[60]=0.58982;y_d2d[60]=1.7164142e-05;x_d2d[61]=0.5998;y_d2d[61]=1.9204132e-05;x_d2d[62]=0.60978;y_d2d[62]=2.1394817e-05;
+        x_d2d[63]=0.61976;y_d2d[63]=2.3540784e-05;x_d2d[64]=0.62974;y_d2d[64]=2.5553337e-05;x_d2d[65]=0.63972;y_d2d[65]=2.772832e-05;
+        x_d2d[66]=0.6497;y_d2d[66]=2.9901059e-05;x_d2d[67]=0.65968;y_d2d[67]=3.2210813e-05;x_d2d[68]=0.66966;y_d2d[68]=3.4646217e-05;
+        x_d2d[69]=0.67964;y_d2d[69]=3.725383e-05;x_d2d[70]=0.68962;y_d2d[70]=3.9806509e-05;x_d2d[71]=0.6996;y_d2d[71]=4.2445837e-05;
+        x_d2d[72]=0.70958;y_d2d[72]=4.5198668e-05;x_d2d[73]=0.71956;y_d2d[73]=4.8021647e-05;x_d2d[74]=0.72954;y_d2d[74]=5.115821e-05;
+        x_d2d[75]=0.73952;y_d2d[75]=5.4318514e-05;x_d2d[76]=0.7495;y_d2d[76]=5.7843626e-05;x_d2d[77]=0.75948;y_d2d[77]=6.1692672e-05;
+        x_d2d[78]=0.76946;y_d2d[78]=6.5642899e-05;x_d2d[79]=0.77944;y_d2d[79]=6.9928578e-05;x_d2d[80]=0.78942;y_d2d[80]=7.4977784e-05;
+        x_d2d[81]=0.7994;y_d2d[81]=8.0453097e-05;x_d2d[82]=0.80938;y_d2d[82]=8.6392506e-05;x_d2d[83]=0.81936;y_d2d[83]=9.3546508e-05;
+        x_d2d[84]=0.82934;y_d2d[84]=0.00010178388;x_d2d[85]=0.83932;y_d2d[85]=0.00011149574;x_d2d[86]=0.8493;y_d2d[86]=0.00012357913;
+        x_d2d[87]=0.85928;y_d2d[87]=0.00013891077;x_d2d[88]=0.86926;y_d2d[88]=0.0001586681;x_d2d[89]=0.87924;y_d2d[89]=0.00018837281;
+        x_d2d[90]=0.88922;y_d2d[90]=0.00023687038;x_d2d[91]=0.8992;y_d2d[91]=0.00035347006;x_d2d[92]=0.90918;y_d2d[92]=0.012701546;
+        x_d2d[93]=0.91916;y_d2d[93]=0.029490393;x_d2d[94]=0.92914;y_d2d[94]=0.045054655;x_d2d[95]=0.93912;y_d2d[95]=0.063629696;
+        x_d2d[96]=0.9491;y_d2d[96]=0.083340718;x_d2d[97]=0.95908;y_d2d[97]=0.1078458;x_d2d[98]=0.96906;y_d2d[98]=0.14600433;
+        x_d2d[99]=0.97904;y_d2d[99]=0.21093271;x_d2d[100]=0.98902;y_d2d[100]=0.37735602;x_d2d[101]=0.999;y_d2d[101]=1.0490255;
+        x_d2d[102]=1;y_d2d[102]=1.0490255;
+
+        // Table: read_noise.pwl (25 points)
+        x_rnoise[0]=0;y_rnoise[0]=0.13615812;x_rnoise[1]=0.00012494;y_rnoise[1]=0.048888346;x_rnoise[2]=0.00024988;y_rnoise[2]=0.029798459;
+        x_rnoise[3]=0.00037481;y_rnoise[3]=0.021433367;x_rnoise[4]=0.00049975;y_rnoise[4]=0.016737146;x_rnoise[5]=0.24987506;y_rnoise[5]=5.6754121e-05;
+        x_rnoise[6]=0.25;y_rnoise[6]=5.6735179e-05;x_rnoise[7]=0.25012494;y_rnoise[7]=5.6716037e-05;x_rnoise[8]=0.25024988;y_rnoise[8]=5.6697222e-05;
+        x_rnoise[9]=0.25037481;y_rnoise[9]=5.6678251e-05;x_rnoise[10]=0.49975012;y_rnoise[10]=3.7703211e-05;x_rnoise[11]=0.49987506;y_rnoise[11]=3.76985e-05;
+        x_rnoise[12]=0.5;y_rnoise[12]=3.7693727e-05;x_rnoise[13]=0.50012494;y_rnoise[13]=3.7688915e-05;x_rnoise[14]=0.50024988;y_rnoise[14]=3.768418e-05;
+        x_rnoise[15]=0.74962519;y_rnoise[15]=3.1351678e-05;x_rnoise[16]=0.74975012;y_rnoise[16]=3.1349538e-05;x_rnoise[17]=0.74987506;y_rnoise[17]=3.1347457e-05;
+        x_rnoise[18]=0.75;y_rnoise[18]=3.1345381e-05;x_rnoise[19]=0.75012494;y_rnoise[19]=3.134323e-05;x_rnoise[20]=0.99950025;y_rnoise[20]=2.8175729e-05;
+        x_rnoise[21]=0.99962519;y_rnoise[21]=2.8174508e-05;x_rnoise[22]=0.99975012;y_rnoise[22]=2.8173331e-05;x_rnoise[23]=0.99987506;y_rnoise[23]=2.8172154e-05;
+        x_rnoise[24]=1;y_rnoise[24]=2.8170942e-05;
+
+        // Table: write_noise.pwl (52 points)
+        x_wnoise[0]=0;y_wnoise[0]=0.050580369;x_wnoise[1]=0.01;y_wnoise[1]=0.050580369;x_wnoise[2]=0.03;y_wnoise[2]=0.052587905;
+        x_wnoise[3]=0.05;y_wnoise[3]=0.054248443;x_wnoise[4]=0.07;y_wnoise[4]=0.055833793;x_wnoise[5]=0.09;y_wnoise[5]=0.057531689;
+        x_wnoise[6]=0.11;y_wnoise[6]=0.059214094;x_wnoise[7]=0.13;y_wnoise[7]=0.060749099;x_wnoise[8]=0.15;y_wnoise[8]=0.062212278;
+        x_wnoise[9]=0.17;y_wnoise[9]=0.063853395;x_wnoise[10]=0.19;y_wnoise[10]=0.065546983;x_wnoise[11]=0.21;y_wnoise[11]=0.067155341;
+        x_wnoise[12]=0.23;y_wnoise[12]=0.068659931;x_wnoise[13]=0.25;y_wnoise[13]=0.070022139;x_wnoise[14]=0.27;y_wnoise[14]=0.071911456;
+        x_wnoise[15]=0.29;y_wnoise[15]=0.073912699;x_wnoise[16]=0.31;y_wnoise[16]=0.074919508;x_wnoise[17]=0.33;y_wnoise[17]=0.076397791;
+        x_wnoise[18]=0.35;y_wnoise[18]=0.077608018;x_wnoise[19]=0.37;y_wnoise[19]=0.079386027;x_wnoise[20]=0.39;y_wnoise[20]=0.081001683;
+        x_wnoise[21]=0.41;y_wnoise[21]=0.082521151;x_wnoise[22]=0.43;y_wnoise[22]=0.084363576;x_wnoise[23]=0.45;y_wnoise[23]=0.085674131;
+        x_wnoise[24]=0.47;y_wnoise[24]=0.087454026;x_wnoise[25]=0.49;y_wnoise[25]=0.088696309;x_wnoise[26]=0.51;y_wnoise[26]=0.089716837;
+        x_wnoise[27]=0.53;y_wnoise[27]=0.091956084;x_wnoise[28]=0.55;y_wnoise[28]=0.093638392;x_wnoise[29]=0.57;y_wnoise[29]=0.094331591;
+        x_wnoise[30]=0.59;y_wnoise[30]=0.096044309;x_wnoise[31]=0.61;y_wnoise[31]=0.097147794;x_wnoise[32]=0.63;y_wnoise[32]=0.099510746;
+        x_wnoise[33]=0.65;y_wnoise[33]=0.10033079;x_wnoise[34]=0.67;y_wnoise[34]=0.10188007;x_wnoise[35]=0.69;y_wnoise[35]=0.10376502;
+        x_wnoise[36]=0.71;y_wnoise[36]=0.10432059;x_wnoise[37]=0.73;y_wnoise[37]=0.10606829;x_wnoise[38]=0.75;y_wnoise[38]=0.10816021;
+        x_wnoise[39]=0.77;y_wnoise[39]=0.10885012;x_wnoise[40]=0.79;y_wnoise[40]=0.11106551;x_wnoise[41]=0.81;y_wnoise[41]=0.11247387;
+        x_wnoise[42]=0.83;y_wnoise[42]=0.11397918;x_wnoise[43]=0.85;y_wnoise[43]=0.11509547;x_wnoise[44]=0.87;y_wnoise[44]=0.11645772;
+        x_wnoise[45]=0.89;y_wnoise[45]=0.11855597;x_wnoise[46]=0.91;y_wnoise[46]=0.11930791;x_wnoise[47]=0.93;y_wnoise[47]=0.12134406;
+        x_wnoise[48]=0.95;y_wnoise[48]=0.12311425;x_wnoise[49]=0.97;y_wnoise[49]=0.12459999;x_wnoise[50]=0.99;y_wnoise[50]=0.12582598;
+        x_wnoise[51]=1;y_wnoise[51]=0.12582598;
+
+        // Table: V_scale.pwl (2 points)
+        y_vscale[0]=0.343826;
+
+        // Table: I_scale.pwl (2 points)
+        y_iscale[0]=0.00025;
+
+            inv_v_scale_val = 1.0 / y_vscale[0];
+            // One-Time Device-to-Device (D2D) Quantile Evaluation
+            if (d2d_variation_intensity > 0.0) begin
+                `PWL_LOOKUP(d2d_delta, d2d_u, x_d2d, y_d2d, 103)
+                gScale_eff = gScale * (1.0 + d2d_variation_intensity * d2d_delta);
+                if (gScale_eff < 1e-6) gScale_eff = 1e-6;
+            end else begin
+                gScale_eff = gScale;
+            end
+            g_i_scale      = gScale_eff * y_iscale[0];
+        end
+
+
+        // 1. Read Terminal Voltage & Ambient Environment Temperature
+        t_amb = $temperature;
+        v_int = V(TE, BE);
+        abs_v = abs(v_int);
+
+        // 2. Continuous State Integrations via Native idt Operator
+        n_raw     = idt(dn_dt, n_init);
+        mode_raw  = idt(d_mode_dt, 1.0);
+        temp_raw  = idt(d_temp_dt, t_amb);
+
+        // State Clamping for Robust Numerical Evaluation
+        if (n_raw < 0.0)             n_curr = 0.0;
+        else if (n_raw > n_max)      n_curr = n_max;
+        else                         n_curr = n_raw;
+
+        if (mode_raw < 0.0)          mode_curr = 0.0;
+        else if (mode_raw > 1.0)     mode_curr = 1.0;
+        else                         mode_curr = mode_raw;
+
+        if (temp_raw < t_amb)        temp_curr = t_amb;
+        else if (temp_raw > 1500.0)  temp_curr = 1500.0;
+        else                         temp_curr = temp_raw;
+
+        // Dynamic Overdrive State Latch (matches Python device_jit.py lines 489-496)
+        if (mode_curr > 0.5 && n_curr > n_base_nominal) begin
+            if (v_int > Vref_pos && (d_val_pos > 1e-6)) begin
+                od_inst = (v_int - Vref_pos) * inv_d_val_pos;
+                if (od_inst > c_od_latch) c_od_latch = od_inst;
+            end
+        end else if (n_curr <= n_base) begin
+            c_od_latch = 0.0;
+        end
+        c_od_curr = (c_od_latch > 10.0) ? 10.0 : ((c_od_latch < 0.0) ? 0.0 : c_od_latch);
+
+        // Dynamic Landing Baseline Floor & Overdrive Memory Clamp
+        if (c_od_curr <= 0.0) begin
+            od_clamp = 0.0;
+            n_base = n_base_nominal;
+        end else begin
+            overdrive = (k_overdrive > 0.0) ? (c_od_curr * k_overdrive) : 0.0;
+            od_clamp = (overdrive > 1.0) ? 1.0 : overdrive;
+            n_base = n_base_nominal * (1.0 - od_clamp * one_minus_scale_base);
+        end
+
+        // High-Field Stark Dynamic Barrier Scaling (matches device_jit.py)
+        if (v_int > Vref_pos && (beta_alpha != 0.0 || beta_s != 0.0)) begin
+            delta_v = (v_int - Vref_pos) * inv_d_val_pos;
+            tanh_delta_v = tanh(delta_v);
+            alpha_eff = alpha + beta_alpha * tanh_delta_v;
+            if (alpha_eff < 0.1) alpha_eff = 0.1;
+            else if (alpha_eff > 1000.0) alpha_eff = 1000.0;
+            n_smooth_eff = n_smooth * (1.0 + beta_s * tanh_delta_v);
+            if (n_smooth_eff < 1.0) n_smooth_eff = 1.0;
+            else if (n_smooth_eff > 1000.0) n_smooth_eff = 1000.0;
+        end else begin
+            alpha_eff = alpha;
+            n_smooth_eff = n_smooth;
+        end
+
+        // --------------------------------------------------------------------
+        // KINETIC RATES DETERMINATION (dn_dt, d_mode_dt)
+        // --------------------------------------------------------------------
+        if (abs_v < 1e-6) begin
+            // FASTPATH 1: Near-Zero Applied Voltage (|V| < 1e-6 V)
+            dn_dt     = 0.0;
+            d_mode_dt = -1000.0 * mode_curr;
+            v_tanh    = 0.0;
+        end
+        else if ((n_curr >= n_max && v_int >= Vth) || (n_curr <= 0.0 && v_int <= -Vth)) begin
+            // FASTPATH 2: Boundary Saturation under Drive Voltages
+            dn_dt       = 0.0;
+            target_mode = (v_int > 0.0) ? 1.0 : 0.0;
+            d_mode_dt   = (target_mode - mode_curr) * 1.0e9;
+            v_tanh      = (v_int > 0.0) ? 1.0 : -1.0;
+        end
+        else begin
+            // FULL PATH: General Active Kinetic Dynamics
+            tanh_arg = v_int * inv_V_smooth;
+            if (tanh_arg > 20.0)       v_tanh = 1.0;
+            else if (tanh_arg < -20.0) v_tanh = -1.0;
+            else                       v_tanh = tanh(tanh_arg);
+
+            if (abs_v < vBypass && (n_curr <= n_base || K_discharge == 0.0)) begin
+                dn_dt = 0.0;
+            end else begin
+                softplus_arg = (abs_v - Vth) * inv_V_smooth;
+                if (softplus_arg > 20.0)       softplus = softplus_arg;
+                else if (softplus_arg < -20.0) softplus = 0.0;
+                else                           softplus = ln(1.0 + exp(softplus_arg));
+
+                if (softplus <= 0.0) begin
+                    dn_dt = 0.0;
+                end else begin
+                    if (v_tanh > 0.0) begin
+                        w_bound = (1.5 * n_smooth_eff > 50.0) ? (1.5 * n_smooth_eff) : 50.0;
+                        dist_bound = n_max - n_curr;
+                        if (dist_bound >= w_bound) clamp_factor = 1.0;
+                        else if (dist_bound <= 0.0) clamp_factor = 0.0;
+                        else begin
+                            z_bound = dist_bound / w_bound;
+                            clamp_factor = z_bound * z_bound * (3.0 - 2.0 * z_bound);
+                        end
+                    end else if (v_tanh < 0.0) begin
+                        w_bound = 30.0;
+                        if (n_curr >= w_bound) clamp_factor = 1.0;
+                        else if (n_curr <= 0.0) clamp_factor = 0.0;
+                        else begin
+                            z_bound = n_curr * inv_30;
+                            clamp_factor = z_bound * z_bound * (3.0 - 2.0 * z_bound);
+                        end
+                    end else begin
+                        clamp_factor = 1.0;
+                    end
+
+                    kappa_clamp = kappa * clamp_factor;
+
+                    if (v_tanh == 1.0) begin
+                        base_rate = softplus * vs_inv_d_val_pos;
+                        dn_dt = pow(base_rate, alpha_eff) * kappa_clamp;
+                    end else if (v_tanh == -1.0) begin
+                        base_rate = softplus * vs_inv_d_val_neg;
+                        dn_dt = -pow(base_rate, alpha_eff) * (kappa_clamp * rate_asymmetry);
+                    end else begin
+                        s_pol = 0.5 * (1.0 + v_tanh);
+                        vref_eff = s_pol * Vref_pos + (1.0 - s_pol) * Vref_neg;
+                        d_val = vref_eff - Vth + 1e-6;
+                        base_rate = (V_smooth * softplus * abs(v_tanh)) / ((d_val > 1e-15) ? d_val : 1e-15);
+                        rate_mag = pow(base_rate, alpha_eff);
+                        if (v_tanh > 0.0) begin
+                            dn_dt = rate_mag * v_tanh * kappa_clamp;
+                        end else begin
+                            dn_dt = rate_mag * v_tanh * (kappa_clamp * rate_asymmetry);
+                        end
+                    end
+                end
+            end
+
+            // Unified Saturation Recovery (matches device_jit.py lines 231-285)
+            if ((mode_curr < 0.45 || v_tanh < 0.0) && n_curr > 500.0) begin
+                u_base = (n_curr - (n_base - 150.0)) * inv_300;
+                if (u_base >= 1.0)      s_base = 1.0;
+                else if (u_base <= 0.0) s_base = 0.0;
+                else                    s_base = u_base * u_base * (3.0 - 2.0 * u_base);
+
+                if (s_base > 0.0) begin
+                    n_turnaround = n_max;
+                    excursion = n_turnaround - n_base;
+                    if (excursion < 100.0) excursion = 100.0;
+
+                    u_rec = (n_curr - n_base) / excursion;
+                    if (u_rec < 0.0) u_rec = 0.0;
+                    else if (u_rec > 1.0) u_rec = 1.0;
+
+                    w_top = scale_top * excursion;
+                    if (w_top < 30.0) w_top = 30.0;
+                    dist_from_peak = n_turnaround - n_curr;
+                    if (dist_from_peak >= w_top) s_top = 1.0;
+                    else if (dist_from_peak <= 0.0) s_top = 0.0;
+                    else begin
+                        z_top = dist_from_peak / w_top;
+                        s_top = z_top * z_top * (3.0 - 2.0 * z_top);
+                    end
+
+                    r_lat_eff = (od_clamp > 0.0) ? (((1.0 - od_clamp) > 0.0) ? (r_lat * (1.0 - od_clamp)) : 0.0) : r_lat;
+                    u_decay = (u_rec > 0.0) ? pow(u_rec, p_decay) : 0.0;
+                    eff_rate_factor = (1.0 - r_lat_eff) + (r_lat_eff + k_amp * s_top) * u_decay;
+                    eff_mult = 1.0 - s_base * (1.0 - eff_rate_factor);
+                    dn_dt = dn_dt * eff_mult;
+                end
+            end
+
+            // Thermal Arrhenius Acceleration Scaling
+            if (E_a > 0.0 && R_th > 0.0) begin
+                if (abs(temp_curr - 298.15) < 1e-4) begin
+                    thermal_factor = 1.0;
+                end else begin
+                    thermal_factor = exp(ea_arrhenius * (0.00335401643468 - 1.0 / temp_curr));
+                end
+                dn_dt = dn_dt * thermal_factor;
+            end
+
+            // Cycle-to-Cycle Langevin Write Noise
+            if (noise_en > 0.5 && write_noise_intensity > 0.0 && abs_v > Vth) begin
+                `PWL_LOOKUP(rel_sigma_write, f22_active, x_wnoise, y_wnoise, 52)
+                if (rel_sigma_write < 0.0) rel_sigma_write = 0.0;
+                dn_dt = dn_dt * (1.0 + write_noise_intensity * rel_sigma_write * write_noise_seed);
+            end
+
+            // Prevent boundary blowup outside [0, n_max]
+            if (n_curr <= 0.0 && dn_dt < 0.0) dn_dt = 0.0;
+            if (n_curr >= n_max && dn_dt > 0.0) dn_dt = 0.0;
+
+            // Direction Latch Hysteresis Dynamics (d_mode/dt)
+            if (abs_v <= Vth) begin
+                d_mode_dt = -1000.0 * mode_curr;
+            end else begin
+                target_mode = (v_int > Vth) ? 1.0 : 0.0;
+                d_mode_dt   = (target_mode - mode_curr) * 1.0e9;
+            end
+        end
+
+        // --------------------------------------------------------------------
+        // UNIFIED CONDUCTION, TABLES & STATE OUTPUTS
+        // --------------------------------------------------------------------
+        `PWL_O1_LOOKUP(f22_pot_raw, n_curr, y_pot, 33040.0, 0.102905569007, 3401)
+        `PWL_O1_LOOKUP(f22_dep_raw, n_max - n_curr, y_dep, 33040.0, 0.102905569007, 3401)
+
+        f22_pot_scaled = (f22_pot_raw - f22_start_val) * f22_pot_scale_inv;
+        if (f22_pot_scaled > 0.0 && n_curr > 16520.0) begin
+            u_sat = (n_curr - 16520.0) * inv_16520;
+            if (u_sat > 1.0) u_sat = 1.0;
+            f22_pot_scaled = f22_pot_scaled + 0.001 * n_smooth_eff * u_sat * u_sat * (3.0 - 2.0 * u_sat);
+        end
+        f22_dep_scaled = (one_minus_f22_end_val - f22_dep_raw) * f22_dep_scale_inv;
+
+        // Continuity Scale Factor (Algebraic Tracking with Memory Latch)
+        if (mode_curr > 0.6 && v_tanh > 0.0) begin
+            denom_scale = (f22_dep_scaled > 1e-6) ? f22_dep_scaled : 1e-6;
+            target_scale = f22_pot_scaled / denom_scale;
+            if (target_scale < 0.0) target_scale = 0.0;
+            else if (target_scale > 100.0) target_scale = 100.0;
+            scale_latch = target_scale;
+            scale_curr  = target_scale;
+        end else begin
+            scale_curr  = scale_latch;
+        end
+
+        // Active State Selection
+        if (mode_curr > 0.5) begin
+            f22_active = f22_pot_scaled;
+        end else begin
+            f22_active = f22_dep_scaled * scale_curr;
+        end
+        if (f22_active < 0.0) f22_active = 0.0;
+
+        // Output Conduction Current (Analytical zero-volt fastpath matching jit_getIGeq)
+        if (abs_v < 1e-12 || f22_active <= 0.0) begin
+            i_mem = 0.0;
+        end else begin
+            v_clip = (gamma_eff != 0.0) ? (v_int * (1.0 + gamma_eff * f22_active) * inv_v_scale_val) : (v_int * inv_v_scale_val);
+            if (v_clip > 80.0) v_clip = 80.0;
+            else if (v_clip < -80.0) v_clip = -80.0;
+            i_mem = g_i_scale * f22_active * sinh(v_clip);
+        end
+
+        // Joule Self-Heating Thermal ODE
+        if (E_a > 0.0 && R_th > 0.0) begin
+            p_diss = abs(v_int * i_mem);
+            if (p_diss == 0.0 && abs(temp_curr - t_amb) <= 1e-4) begin
+                d_temp_dt = 0.0;
+            end else begin
+                t_steady = t_amb + p_diss * R_th;
+                d_temp_dt = (t_steady - temp_curr) * inv_tau_th;
+            end
+        end else begin
+            d_temp_dt = 0.0;
+        end
+
+        // Apply Branch Current & Monitors
+        I(TE, BE)  <+ i_mem;
+        if (noise_en > 0.5 && read_noise_intensity > 0.0) begin
+            `PWL_LOOKUP(rel_sigma_read, f22_active, x_rnoise, y_rnoise, 25)
+            if (rel_sigma_read < 0.0) rel_sigma_read = 0.0;
+            i_floor_noise = ((abs_v > 1e-6) ? abs_v : 0.1) * 1e-6;
+            i_scale_noise = (abs(i_mem) > i_floor_noise) ? abs(i_mem) : i_floor_noise;
+            pwr_read_noise = 2.0 * pow(read_noise_intensity * rel_sigma_read * i_scale_noise, 2.0) * 1.0e-9;
+            I(TE, BE) <+ white_noise(pwr_read_noise, "read_noise");
+        end
+        if (mon_en > 0) begin
+            V(f22)          <+ f22_active;
+            V(pulseState)   <+ n_curr;
+            V(conductance)  <+ (f22_active > 0.0) ? (g_i_scale * f22_active * (1.0 + gamma_eff * f22_active) * inv_v_scale_val * 1000.0) : 0.0;
+            V(junctionTemp) <+ temp_curr;
+        end
+
+    end
+
+endmodule

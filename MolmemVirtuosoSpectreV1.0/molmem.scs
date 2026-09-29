@@ -1,0 +1,11 @@
+// ============================================================================
+// Molecular Memristor Model Library Master Include Card (Spectre / Virtuoso)
+// File: molmem.scs
+//
+// Top-level entry file pointing to the models subdirectory.
+// Include this file in ADE -> Setup -> Model Libraries.
+// ============================================================================
+
+simulator lang=spectre
+
+include "models/molmem.scs"

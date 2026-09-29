@@ -1,0 +1,44 @@
+// ============================================================================
+// Molecular Memristor I-V Pinched Hysteresis Characteristic Testbench
+// File: tb_iv_sweep.scs
+//
+// Sweeps a continuous triangular voltage waveform (0V -> +1.2V -> -1.0V -> 0V)
+// to capture the non-linear, pinched hysteresis I-V loop.
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+
+
+// Triangular waveform parameters
+parameters tPeriod = 200u
+parameters tStop   = 400u
+
+// Triangular Voltage Generator (PWL)
+vSweep (driveNode 0) vsource type=pwl wave=[ \
+    0.0           0.0 \
+    (0.25*tPeriod)  1.2 \
+    (0.50*tPeriod)  0.0 \
+    (0.75*tPeriod) -1.0 \
+    (1.00*tPeriod)  0.0 \
+    (1.25*tPeriod)  1.2 \
+    (1.50*tPeriod)  0.0 \
+    (1.75*tPeriod) -1.0 \
+    (2.00*tPeriod)  0.0 \
+]
+
+// Diagnostic DUT Instance
+Xdut (driveNode 0 f22 pulseState conductance junctionTemp) molmem_device_mon n_init=0.0
+
+// Transient Analysis
+tranIv tran stop=tStop step=10n maxstep=1n errpreset=conservative
+
+// Waveform Saves (Exact 1-to-1 Parity with Python Subfigures)
+save driveNode
+save vSweep
+save f22
+save pulseState
+save conductance
+save junctionTemp
+save Xdut:Anode

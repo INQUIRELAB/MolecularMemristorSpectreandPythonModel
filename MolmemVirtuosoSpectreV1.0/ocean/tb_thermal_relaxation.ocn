@@ -1,0 +1,78 @@
+; ============================================================================
+; Cadence Virtuoso Viva Waveform Display Script: tb_thermal_relaxation.ocn
+; File: SpectreModelsV2/ocean/tb_thermal_relaxation.ocn
+;
+; Automatically configures waveform strips in Cadence Viva matching
+; the Python `tb_thermal_relaxation.py` macro subfigures:
+;   Strip 1: Applied Voltage (V)
+;   Strip 2: Internal Pulse State (n)
+;   Strip 3: Conductance State (f22)
+;   Strip 4: Read Conductance (mS)
+;   Strip 5: Conduction Current (mA)
+;   Strip 6: Junction Temperature (K)
+; ============================================================================
+
+simulator('spectre)
+
+resultsDir = cond(
+    (isDir("./tb_thermal_relaxation.raw")               "./tb_thermal_relaxation.raw")
+    (isDir("./testbenches/tb_thermal_relaxation.raw")   "./testbenches/tb_thermal_relaxation.raw")
+    (isDir("../testbenches/tb_thermal_relaxation.raw")  "../testbenches/tb_thermal_relaxation.raw")
+    (t                                                  "./tb_thermal_relaxation.raw")
+)
+if(isDir(resultsDir) then
+    openResults(resultsDir)
+
+    availResults = results()
+    cond(
+        (member('tran availResults)                  selectResult('tran))
+        (member("tran-tran" availResults)            selectResult("tran-tran"))
+        (member('tranThermal availResults)           selectResult('tranThermal))
+        (member('tranThermal-tran availResults)      selectResult('tranThermal-tran))
+        (member("tranThermal-tran" availResults)     selectResult("tranThermal-tran"))
+        (member('tran-tran availResults)             selectResult('tran-tran))
+        (t
+            ; Fallback: prefer transient dataset over static variables table
+            let((tranDs)
+                tranDs = car(setof(x availResults pcreMatchp("tran" sprintf(nil "%s" x))))
+                if(tranDs then
+                    selectResult(tranDs)
+                else
+                    if(availResults then selectResult(car(last(availResults))))
+                )
+            )
+        )
+    )
+
+    win = newWindow()
+    when(isCallable('addSubwindowTitle)
+        addSubwindowTitle("MolMemristor Thermal Relaxation & State Stability (Cadence Spectre)")
+    )
+    when(isCallable('awvSetWindowTitle) && boundp('win) && win
+        awvSetWindowTitle(win "MolMemristor Thermal Relaxation & State Stability (Cadence Spectre)")
+    )
+
+    vDrive       = nil
+    errset(vDrive = v("driveNode") || v("vDrive") || v("V_drive") || v("/driveNode") nil)
+    pulseState   = nil
+    errset(pulseState = v("pulseState") || v("n_mon") || v("/pulseState") nil)
+    f22          = nil
+    errset(f22 = v("f22") || v("condState") || v("f22_mon") || v("/f22") nil)
+    conductance  = nil
+    errset(conductance = v("conductance") || v("g_mon") || v("/conductance") nil)
+    iMem         = nil
+    errset(iMem = i("Xdut:Anode") * 1.0e3 || i("/Xdut/Anode") * 1.0e3 nil)
+    junctionTemp = nil
+    errset(junctionTemp = v("junctionTemp") || v("temp_mon") || v("/junctionTemp") nil)
+
+    when(vDrive       plot(vDrive       ?expr '("Applied V")))
+    when(pulseState   when(isCallable('addStrip) addStrip()) plot(pulseState   ?expr '("Internal Pulse State (n)")))
+    when(f22          when(isCallable('addStrip) addStrip()) plot(f22          ?expr '("Conductance State (f22)")))
+    when(conductance  when(isCallable('addStrip) addStrip()) plot(conductance  ?expr '("Read Conductance (mS)")))
+    when(iMem         when(isCallable('addStrip) addStrip()) plot(iMem         ?expr '("Current (mA)")))
+    when(junctionTemp when(isCallable('addStrip) addStrip()) plot(junctionTemp ?expr '("Junction Temperature (K)")))
+
+    printf("[Ocean] Waveforms successfully plotted to Viva window.\n")
+else
+    printf("[Ocean] Error: Results directory '%s' not found. Run 'spectre tb_thermal_relaxation.scs' first.\n" resultsDir)
+)

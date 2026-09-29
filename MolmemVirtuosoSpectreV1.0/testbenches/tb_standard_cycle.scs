@@ -1,0 +1,55 @@
+// ============================================================================
+// Molecular Memristor Standard Programming Cycle Testbench
+// File: tb_standard_cycle.scs
+//
+// Replicates `tb_standard_cycle.py`:
+// Evaluates standard potentiation and depotentiation cycle across 33,040 pulses:
+//   - Phase 1: SET (Potentiation) - 16,520 pulses @ +0.9V (80ns width, 160ns period, 0.0 to 2.6432 ms)
+//   - Phase 2: RESET (Depotentiation) - 16,520 pulses @ -0.75V (80ns width, 160ns period, 2.6432 to 5.2864 ms)
+//
+// Diagnostic outputs:
+//   - vDrive       : Applied programming waveform (V)
+//   - f22          : Normalized conductance state (0.0 to 1.0)
+//   - pulseState   : Internal pulse state count (0 to 33,040)
+//   - conductance  : Electrical small-signal read conductance (mS)
+//   - junctionTemp : Internal junction temperature (K)
+//   - Xdut:Anode   : Memristor branch current (A)
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+// --- Timing Parameters ---
+parameters nPulses = 16520
+parameters tPeriod = 160n
+parameters tWidth  = 80n
+parameters vPot    = 0.9
+parameters vDep    = -0.75
+
+parameters tHalf   = 2.6432m     // 16,520 * 160ns = 2.6432 ms
+parameters tStop   = 5.2864m     // 2 * 2.6432 ms = 5.2864 ms
+
+// --- Input Voltage Sources ---
+// Potentiation pulse train (+0.9V, 80ns width, 160ns period)
+Vpot (potNode 0) vsource type=pulse val0=0 val1=vPot period=tPeriod width=tWidth rise=1n fall=1n
+
+// Depotentiation pulse train (-0.75V, 80ns width, 160ns period, starts at tHalf)
+Vdep (depNode 0) vsource type=pulse val0=0 val1=vDep period=tPeriod width=tWidth rise=1n fall=1n delay=tHalf
+
+// Smooth transition from Potentiation to Depotentiation
+vDrive (driveNode 0) bsource v=(time < tHalf) ? V(potNode) : V(depNode)
+
+// --- Device Under Test with 6-Terminal Monitoring Pins ---
+Xdut (driveNode 0 f22 pulseState conductance junctionTemp) molmem_device_mon_default n_init=0.0
+
+// --- Transient Analysis ---
+tranStd tran stop=tStop step=100n maxstep=10n errpreset=moderate
+
+// --- Waveform Saves (Exact 1-to-1 Parity with Python Subfigures) ---
+save driveNode
+save vDrive
+save f22
+save pulseState
+save conductance
+save junctionTemp
+save Xdut:Anode

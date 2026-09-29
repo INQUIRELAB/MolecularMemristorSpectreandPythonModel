@@ -1,0 +1,21 @@
+// ============================================================================
+// Molecular Memristor Model Library Master Include Card (Spectre / Virtuoso)
+// File: models/molmem.scs
+//
+// Automatically configured by SpectreModelDataEncryption/build_encryption_package.py
+// Current Mode: EMBEDDED UNENCRYPTED (Fast Debug Mode)
+// ============================================================================
+
+simulator lang=spectre
+
+// Include the Calibrated Device Parameters Card
+include "molmem_params.scs"
+
+// Include the Verilog-A Compact Physics Core
+ahdl_include "molmem_core_embedded.va"
+
+// Include the Statistical Mismatch & Noise Card
+include "molmem_noise.scs"
+
+// Include the Spectre Device Subcircuit Wrappers
+include "molmem_device.scs"

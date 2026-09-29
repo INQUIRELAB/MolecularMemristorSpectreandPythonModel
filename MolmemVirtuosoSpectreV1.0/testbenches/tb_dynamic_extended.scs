@@ -1,0 +1,40 @@
+// ============================================================================
+// Molecular Memristor Extended 50,000-Pulse Dynamic Cycling Testbench
+// File: tb_dynamic_extended.scs
+//
+// Replicates `tb_dynamic_extended.py`:
+// Validates continuous ultra-long endurance and state stability over 50k pulses:
+//   Phase 1: SET (Potentiation) - 25,000 pulses @ +0.9V (80ns width, 160ns period, 0.0 to 4.0 ms)
+//   Phase 2: RESET (Depotentiation) - 25,000 pulses @ -0.75V (60ns width, 160ns period, 4.0 to 8.0 ms)
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+
+
+// --- Timing Parameters ---
+parameters tSwitch = 4.0m        // 25,000 * 160ns = 4.0 ms
+parameters tStop   = 8.0m        // 50,000 * 160ns = 8.0 ms
+
+// --- Input Voltage Sources ---
+Vpot (potNode 0) vsource type=pulse val0=0 val1=0.9  period=160n width=80n rise=1n fall=1n
+Vdep (depNode 0) vsource type=pulse val0=0 val1=-0.75 period=160n width=80n rise=1n fall=1n delay=tSwitch
+
+// Transition from Potentiation to Depotentiation
+vDrive (driveNode 0) bsource v=(time < tSwitch) ? V(potNode) : V(depNode)
+
+// --- Device Under Test with Monitoring Pins ---
+Xdut (driveNode 0 f22 pulseState conductance junctionTemp) molmem_device_mon_default n_init=0.0
+
+// --- Transient Analysis ---
+tranExt tran stop=tStop step=200n maxstep=10n errpreset=moderate
+
+// --- Waveform Saves (Exact 1-to-1 Parity with Python Subfigures) ---
+save driveNode
+save vDrive
+save f22
+save pulseState
+save conductance
+save junctionTemp
+save Xdut:Anode

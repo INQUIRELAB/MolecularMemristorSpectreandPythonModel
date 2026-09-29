@@ -1,0 +1,66 @@
+// ============================================================================
+// 8x8 Crossbar Matrix Parallel Write Testbench
+// File: tb_crossbar_write.scs
+//
+// Replicates `tb_crossbar_write.py`:
+// Demonstrates selective crossbar programming across multi-device wordlines:
+//   - Row 0 : Full Potentiation (16,520 pulses @ +0.9V, 80ns width, 160ns period)
+//   - Row 2 : Half Potentiation (8,260 pulses @ +0.9V, 80ns width, 160ns period)
+//   - Row 5 : Full Potentiation (16,520 pulses @ +0.9V) followed by 
+//             Quarter Depotentiation (4,130 pulses @ -0.75V, 60ns width, 160ns period)
+//   - Other Rows: Grounded (0.0 V)
+//   - Columns 0-7: Grounded (0.0 V) through 100 Ohm sense resistors
+// ============================================================================
+
+simulator lang=spectre
+include "crossbar_8x8.scs"
+
+
+
+// --- Timing Parameters (synchronized with tb_crossbar_write.py) ---
+parameters t_full_pot     = 2.6432m
+parameters t_half_pot     = 1.3216m
+parameters t_quarter_dep  = 0.6608m
+
+parameters t_dev0_end     = t_full_pot
+parameters t_dev2_start   = t_dev0_end + 100n
+parameters t_dev2_end     = t_dev2_start + t_half_pot
+parameters t_dev5_start   = t_dev2_end + 100n
+parameters t_dev5_pot_end = t_dev5_start + t_full_pot
+parameters t_dev5_end     = t_dev5_pot_end + t_quarter_dep
+parameters t_stop         = t_dev5_end + 1m
+
+// --- Pulse Sources ---
+Vpot_src (vpot_clk 0) vsource type=pulse val0=0 val1=0.9  period=160n width=80n rise=1n fall=1n
+Vdep_src (vdep_clk 0) vsource type=pulse val0=0 val1=-0.75 period=160n width=60n rise=1n fall=1n delay=t_dev5_pot_end
+
+// --- Wordline Driver Voltages ---
+Vrow0 (Row0 0) bsource v=(time < t_dev0_end) ? V(vpot_clk) : 0.0
+Vrow1 (Row1 0) vsource type=dc dc=0
+Vrow2 (Row2 0) bsource v=((time >= t_dev2_start) && (time < t_dev2_end)) ? V(vpot_clk) : 0.0
+Vrow3 (Row3 0) vsource type=dc dc=0
+Vrow4 (Row4 0) vsource type=dc dc=0
+Vrow5 (Row5 0) bsource v=((time >= t_dev5_start) && (time < t_dev5_pot_end)) ? V(vpot_clk) : \
+                        (((time >= t_dev5_pot_end) && (time < t_dev5_end)) ? V(vdep_clk) : 0.0)
+Vrow6 (Row6 0) vsource type=dc dc=0
+Vrow7 (Row7 0) vsource type=dc dc=0
+
+// --- 8x8 Crossbar Instance ---
+Xarray (Row0 Row1 Row2 Row3 Row4 Row5 Row6 Row7 Col0 Col1 Col2 Col3 Col4 Col5 Col6 Col7) crossbar_8x8 n_init_default=0.0
+
+// --- Column Terminations (Sensing Bitlines to Ground) ---
+Rcol0 (Col0 0) resistor r=100
+Rcol1 (Col1 0) resistor r=100
+Rcol2 (Col2 0) resistor r=100
+Rcol3 (Col3 0) resistor r=100
+Rcol4 (Col4 0) resistor r=100
+Rcol5 (Col5 0) resistor r=100
+Rcol6 (Col6 0) resistor r=100
+Rcol7 (Col7 0) resistor r=100
+
+// --- Transient Simulation ---
+tran_write tran stop=t_stop step=100n errpreset=moderate
+
+// --- Waveform Saves ---
+save Row0 Row2 Row5
+save Col0 Col3 Col7

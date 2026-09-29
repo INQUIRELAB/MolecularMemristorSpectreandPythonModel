@@ -1,0 +1,67 @@
+// ============================================================================
+// Molecular Memristor Multi-Channel Noise Validation Testbench
+// File: tb_noise_validation.scs
+//
+// Replicates `tb_noise_validation.py`:
+// Validates all three empirical noise channels directly from PWL tables:
+//   1. Deterministic Baseline (noise_en = 0)
+//   2. Device-to-Device (D2D) Mismatch: Quantile mapping via data/d2d_mismatch_quantile.pwl
+//   3. Temporal Read Noise: Johnson-Nyquist + flicker via data/read_noise.pwl
+//   4. Cycle-to-Cycle Write Noise: Langevin programming variance via data/write_noise.pwl
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+
+
+parameters vRead   = 0.1         // Standardized read amplitude
+parameters tPeriod = 160n
+parameters tPulse  = 80n
+parameters tStop   = 2.0u
+
+// --- Read Pulse Train Generator ---
+vreadSrc (vreadNode 0) vsource type=pulse val0=0 val1=vRead period=tPeriod width=tPulse rise=1n fall=1n
+
+// ----------------------------------------------------------------------------
+// Channel 0: Deterministic Ideal Baseline Device (Noise Disabled)
+// ----------------------------------------------------------------------------
+Xdut_base (vreadNode 0 f22Base pulseStateBase conductanceBase junctionTempBase) molmem_device_mon_default \
+    n_init=16520.0 noise_en=0 d2d_variation_intensity=0.0 read_noise_intensity=0.0
+
+// ----------------------------------------------------------------------------
+// Channel 1: D2D Mismatch Devices (Spread across empirical quantiles u=0.1, 0.5, 0.9)
+// ----------------------------------------------------------------------------
+Xdut_d2d_lo (vreadNode 0 f22Lo pulseStateLo conductanceLo junctionTempLo) molmem_device_mon_default \
+    n_init=16520.0 noise_en=0 d2d_variation_intensity=1.0 d2d_u=0.10
+
+Xdut_d2d_mid (vreadNode 0 f22Mid pulseStateMid conductanceMid junctionTempMid) molmem_device_mon_default \
+    n_init=16520.0 noise_en=0 d2d_variation_intensity=1.0 d2d_u=0.50
+
+Xdut_d2d_hi (vreadNode 0 f22Hi pulseStateHi conductanceHi junctionTempHi) molmem_device_mon_default \
+    n_init=16520.0 noise_en=0 d2d_variation_intensity=1.0 d2d_u=0.90
+
+// ----------------------------------------------------------------------------
+// Channel 2: Temporal Read Noise Active Device (Physical noise from read_noise.pwl)
+// ----------------------------------------------------------------------------
+Xdut_read_noise (vreadNode 0 f22Noise pulseStateNoise conductanceNoise junctionTempNoise) molmem_device_mon_default \
+    n_init=16520.0 noise_en=1 read_noise_intensity=1.0 d2d_variation_intensity=0.0
+
+// ----------------------------------------------------------------------------
+// Transient Noise Simulation (Resolves physical noise spectral density to 10 GHz)
+// ----------------------------------------------------------------------------
+tranNoise tran stop=tStop step=1n maxstep=100p errpreset=conservative \
+    noisefmax=10G noisefmin=10k noiseseed=12345
+
+// --- Waveform Saves ---
+save vreadSrc
+save Xdut_base:Anode
+save Xdut_d2d_lo:Anode
+save Xdut_d2d_mid:Anode
+save Xdut_d2d_hi:Anode
+save Xdut_read_noise:Anode
+save f22Base f22Noise
+save pulseStateBase pulseStateNoise
+save conductanceBase conductanceNoise
+save junctionTempBase junctionTempNoise
+

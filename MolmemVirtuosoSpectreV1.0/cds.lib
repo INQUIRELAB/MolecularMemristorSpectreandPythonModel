@@ -1,0 +1,3 @@
+SOFTINCLUDE /opt/cadence/IC231/share/cdssetup/cds.lib
+DEFINE MolmemLib /home/cadence0/Desktop/MolmemVirtuosoSpectreV1.0/MolmemLib
+DEFINE SchematicTestbenches /home/cadence0/Desktop/MolmemVirtuosoSpectreV1.0/SchematicTestbenches

@@ -1,0 +1,45 @@
+// ============================================================================
+// Molecular Memristor Dynamic SET/RESET Pulse Train Testbench
+// File: tb_dynamic.scs
+//
+// Replicates standard dynamic programming cycles:
+// Phase 1: SET (Potentiation) - 16,520 pulses @ +0.9V (80ns width, 160ns period)
+// Phase 2: RESET (Depotentiation) - 16,520 pulses @ -0.75V (60ns width, 160ns period)
+// ============================================================================
+
+simulator lang=spectre
+
+// Include the Master Library
+include "../models/molmem.scs"
+
+
+
+// --- Timing Parameters ---
+parameters tSwitch = 2.6432m     // 16,520 * 160ns = 2.6432 ms
+parameters tStop   = 5.3m        // 2 * 2.6432 ms ~= 5.3 ms
+
+// --- Input Voltage Sources ---
+// Potentiation pulse train (+0.9V, 80ns width, 160ns period)
+Vpot (potNode 0) vsource type=pulse val0=0 val1=0.9 period=160n width=80n rise=1n fall=1n
+
+// Depotentiation pulse train (-0.75V, 80ns width, 160ns period)
+Vdep (depNode 0) vsource type=pulse val0=0 val1=-0.75 period=160n width=80n rise=1n fall=1n delay=tSwitch
+
+// Smooth transition from Potentiation to Depotentiation
+vDrive (driveNode 0) bsource v=(time < tSwitch) ? V(potNode) : V(depNode)
+
+// --- Device Under Test (Diagnostic Cell with Monitors) ---
+Xdut (driveNode 0 f22 pulseState conductance junctionTemp) molmem_device_mon n_init=0.0
+
+// --- Transient Analysis ---
+tranDynamic tran stop=tStop step=100n maxstep=10n errpreset=moderate
+
+// --- Waveform Saves (Exact 1-to-1 Parity with Python Subfigures) ---
+save driveNode
+save vDrive
+save f22
+save pulseState
+save conductance
+save junctionTemp
+save Xdut:Anode
+

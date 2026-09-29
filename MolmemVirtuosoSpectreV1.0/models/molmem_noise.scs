@@ -1,0 +1,18 @@
+// ============================================================================
+// Molecular Memristor Statistical Mismatch & Noise Model Card (Spectre)
+// File: molmem_noise.scs
+//
+// Defines statistical distributions for Cadence Virtuoso ADE Monte Carlo sweeps:
+//   - d2d_u: Uniform random quantile in [0, 1] mapped through empirical Inverse-CDF
+//            quantile table (data/d2d_mismatch_quantile.pwl).
+//   - write_noise_seed: Standard normal N(0, 1) cycle-to-cycle Langevin write stochasticity.
+// ============================================================================
+
+simulator lang=spectre
+
+statistics {
+    mismatch {
+        vary molmem_d2d_u dist=unif val=0.5
+        vary molmem_write_noise_seed dist=gauss std=1.0
+    }
+}

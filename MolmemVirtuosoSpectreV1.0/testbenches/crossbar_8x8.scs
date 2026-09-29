@@ -1,0 +1,93 @@
+// ============================================================================
+// 8x8 Molecular Memristor Crossbar Array Subcircuit
+// File: crossbar_8x8.scs
+//
+// 8 Row wordlines (Row0 - Row7) x 8 Column bitlines (Col0 - Col7).
+// Reusable 8x8 crossbar array instantiator block for array testbenches.
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+subckt crossbar_8x8 (Row0 Row1 Row2 Row3 Row4 Row5 Row6 Row7 Col0 Col1 Col2 Col3 Col4 Col5 Col6 Col7)
+    parameters device_type=0
+    parameters Rc=0.008033
+    parameters n_init_default=0.0
+    parameters noise_en=0
+    parameters d2d_variation_intensity=0.0
+    parameters read_noise_intensity=0.0
+    parameters write_noise_intensity=0.0
+
+    Xmem_0_0 (Row0 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_0_1 (Row0 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_0_2 (Row0 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_0_3 (Row0 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_0_4 (Row0 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_0_5 (Row0 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_0_6 (Row0 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_0_7 (Row0 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+    Xmem_1_0 (Row1 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_1_1 (Row1 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_1_2 (Row1 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_1_3 (Row1 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_1_4 (Row1 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_1_5 (Row1 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_1_6 (Row1 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_1_7 (Row1 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+    Xmem_2_0 (Row2 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_2_1 (Row2 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_2_2 (Row2 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_2_3 (Row2 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_2_4 (Row2 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_2_5 (Row2 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_2_6 (Row2 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_2_7 (Row2 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+    Xmem_3_0 (Row3 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_3_1 (Row3 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_3_2 (Row3 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_3_3 (Row3 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_3_4 (Row3 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_3_5 (Row3 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_3_6 (Row3 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_3_7 (Row3 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+    Xmem_4_0 (Row4 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_4_1 (Row4 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_4_2 (Row4 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_4_3 (Row4 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_4_4 (Row4 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_4_5 (Row4 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_4_6 (Row4 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_4_7 (Row4 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+    Xmem_5_0 (Row5 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_5_1 (Row5 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_5_2 (Row5 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_5_3 (Row5 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_5_4 (Row5 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_5_5 (Row5 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_5_6 (Row5 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_5_7 (Row5 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+    Xmem_6_0 (Row6 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_6_1 (Row6 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_6_2 (Row6 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_6_3 (Row6 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_6_4 (Row6 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_6_5 (Row6 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_6_6 (Row6 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_6_7 (Row6 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+    Xmem_7_0 (Row7 Col0) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_7_1 (Row7 Col1) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_7_2 (Row7 Col2) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_7_3 (Row7 Col3) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_7_4 (Row7 Col4) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_7_5 (Row7 Col5) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_7_6 (Row7 Col6) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+    Xmem_7_7 (Row7 Col7) molmem_device device_type=device_type Rc=Rc n_init=n_init_default noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity
+
+ends crossbar_8x8

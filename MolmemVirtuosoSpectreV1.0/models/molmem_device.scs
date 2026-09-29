@@ -1,0 +1,337 @@
+// ============================================================================
+// Molecular Memristor Device Subcircuit Wrappers (Spectre)
+// File: models/molmem_device.scs
+//
+// Provides Virtuoso-compatible subcircuit cells:
+//   1. molmem_device (Anode Cathode) : Standard 2-terminal cell with device_type switch
+//   2. molmem_device_default (Anode Cathode) : Explicit Default model instance
+//   3. molmem_device_ru_azo (Anode Cathode) : Explicit Ru_azo calibrated model instance
+//   4. molmem_device_mon (Anode Cathode f22 pulseState conductance junctionTemp) : 6-terminal diagnostic cell
+//   5. molmem_device_mon_default / molmem_device_mon_ru_azo : Monitored explicit cells
+//   6. molmem_device_mon_4term : 4-terminal legacy diagnostic adapter
+//   7. molmem_1t1r (WL BL SL) : 3-terminal 1-Transistor-1-Memristor crossbar cell
+//   8. molmem / molmem_ru_azo (plus minus) : Universal 2-terminal symbol aliases
+//
+// Default physical parameters are defined in models/molmem_params.scs.
+// ============================================================================
+
+simulator lang=spectre
+
+// ----------------------------------------------------------------------------
+// 1. Standard 2-Terminal Production Subcircuit (Anode, Cathode)
+//    device_type: 0 = Default Model, 1 = Ru_azo Calibrated Model
+//    Default parameters inherit from molmem_params.scs
+// ----------------------------------------------------------------------------
+subckt molmem_device (Anode Cathode)
+    
+    // Model Selection: 0 = Default, 1 = Ru_azo
+    parameters device_type=0
+
+    // Interface & State Parameters
+    // Normalized state_init in [0.0, 1.0] maps linearly to [0, 16520 pulses]
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters n_init_eff = (state_init >= 0.0) ? (state_init * 16520.0) : ((n_init >= 0.0) ? ((n_init > 1.0) ? n_init : (n_init * 16520.0)) : 0.0)
+    
+    // Physics Hyperparameters (defaults from molmem_params.scs)
+    parameters kappa=molmem_kappa alpha=molmem_alpha gScale=molmem_gScale \
+        Vth=molmem_Vth Vref_pos=molmem_Vref_pos Vref_neg=molmem_Vref_neg \
+        K_discharge=molmem_K_discharge rate_asymmetry=molmem_rate_asymmetry \
+        V_smooth=molmem_V_smooth n_smooth=molmem_n_smooth n_max=molmem_n_max
+
+    // Stark & Thermal Hyperparameters
+    parameters gamma=molmem_gamma beta_alpha=molmem_beta_alpha beta_s=molmem_beta_s \
+        E_a=molmem_E_a R_th=molmem_R_th tau_th=molmem_tau_th
+
+    // Unified Saturation & Recovery Parameters
+    parameters rTopBlend=molmem_rTopBlend fDischarge=molmem_fDischarge cDischarge=molmem_cDischarge \
+        rBottomBlend=molmem_rBottomBlend rLatency=molmem_rLatency k_overdrive=molmem_k_overdrive
+
+    // Lookup Table Boundary Points
+    parameters f22_start_val=molmem_f22_start_val f22_peak_val=molmem_f22_peak_val f22_end_val=molmem_f22_end_val
+
+    // Empirical Multi-Channel Noise Parameters
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+
+    // Diagnostic Monitor Switch: 0 = Production (No matrix monitor branches), 1 = Monitored
+    parameters mon_en=0
+
+    // Lumped Series Contact Resistance: Anode -> TE (R_contact = 2*Rc)
+    R_contact (Anode TE) resistor r=2*Rc
+
+    // Verilog-A Core Physics Instance (BE connects directly to Cathode)
+    Xcore (TE Cathode f22Internal pulseInternal gInternal tempInternal) molmem_core mon_en=mon_en \
+        V_smooth=V_smooth n_smooth=n_smooth kappa=kappa alpha=alpha gScale=gScale \
+        Vth=Vth Vref_pos=Vref_pos Vref_neg=Vref_neg rate_asymmetry=rate_asymmetry \
+        n_max=n_max n_init=n_init_eff K_discharge=K_discharge \
+        gamma=gamma beta_alpha=beta_alpha beta_s=beta_s \
+        E_a=E_a R_th=R_th tau_th=tau_th \
+        rTopBlend=rTopBlend fDischarge=fDischarge cDischarge=cDischarge \
+        rBottomBlend=rBottomBlend rLatency=rLatency k_overdrive=k_overdrive \
+        f22_start_val=f22_start_val f22_peak_val=f22_peak_val f22_end_val=f22_end_val \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+
+ends molmem_device
+
+
+// Explicit Pre-Configured Subcircuits for Direct Instantiation
+subckt molmem_device_default (Anode Cathode)
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0 noise_en=molmem_noise_en \
+        d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    Xdev (Anode Cathode) molmem_device device_type=0 Rc=Rc state_init=state_init n_init=n_init \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+ends molmem_device_default
+
+subckt molmem_device_ru_azo (Anode Cathode)
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0 noise_en=molmem_noise_en \
+        d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    Xdev (Anode Cathode) molmem_device device_type=1 Rc=Rc state_init=state_init n_init=n_init \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+ends molmem_device_ru_azo
+
+
+// ----------------------------------------------------------------------------
+// 2. Diagnostic 6-Terminal Subcircuit with Monitoring Pins (Anode, Cathode, f22, pulseState, conductance, junctionTemp)
+// ----------------------------------------------------------------------------
+subckt molmem_device_mon (Anode Cathode f22 pulseState conductance junctionTemp)
+    
+    // Model Selection: 0 = Default, 1 = Ru_azo
+    parameters device_type=0
+
+    // Interface & State Parameters
+    // Normalized state_init in [0.0, 1.0] maps linearly to [0, 16520 pulses]
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters n_init_eff = (state_init >= 0.0) ? (state_init * 16520.0) : ((n_init >= 0.0) ? ((n_init > 1.0) ? n_init : (n_init * 16520.0)) : 0.0)
+    
+    // Physics Hyperparameters (defaults from molmem_params.scs)
+    parameters kappa=molmem_kappa alpha=molmem_alpha gScale=molmem_gScale \
+        Vth=molmem_Vth Vref_pos=molmem_Vref_pos Vref_neg=molmem_Vref_neg \
+        K_discharge=molmem_K_discharge rate_asymmetry=molmem_rate_asymmetry \
+        V_smooth=molmem_V_smooth n_smooth=molmem_n_smooth n_max=molmem_n_max
+
+    // Stark & Thermal Hyperparameters
+    parameters gamma=molmem_gamma beta_alpha=molmem_beta_alpha beta_s=molmem_beta_s \
+        E_a=molmem_E_a R_th=molmem_R_th tau_th=molmem_tau_th
+
+    // Unified Saturation & Recovery Parameters
+    parameters rTopBlend=molmem_rTopBlend fDischarge=molmem_fDischarge cDischarge=molmem_cDischarge \
+        rBottomBlend=molmem_rBottomBlend rLatency=molmem_rLatency k_overdrive=molmem_k_overdrive
+
+    // Lookup Table Boundary Points
+    parameters f22_start_val=molmem_f22_start_val f22_peak_val=molmem_f22_peak_val f22_end_val=molmem_f22_end_val
+
+    // Empirical Multi-Channel Noise Parameters
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+
+    // Diagnostic Monitor Switch: Defaults to 1 (Enabled for diagnostic subcircuit)
+    parameters mon_en=1
+
+    // Lumped Series Contact Resistance: Anode -> TE (R_contact = 2*Rc)
+    R_contact (Anode TE) resistor r=2*Rc
+
+    // Verilog-A Core Physics Instance with exported monitor nodes (BE connects directly to Cathode)
+    Xcore (TE Cathode f22 pulseState conductance junctionTemp) molmem_core mon_en=mon_en \
+        V_smooth=V_smooth n_smooth=n_smooth kappa=kappa alpha=alpha gScale=gScale \
+        Vth=Vth Vref_pos=Vref_pos Vref_neg=Vref_neg rate_asymmetry=rate_asymmetry \
+        n_max=n_max n_init=n_init_eff K_discharge=K_discharge \
+        gamma=gamma beta_alpha=beta_alpha beta_s=beta_s \
+        E_a=E_a R_th=R_th tau_th=tau_th \
+        rTopBlend=rTopBlend fDischarge=fDischarge cDischarge=cDischarge \
+        rBottomBlend=rBottomBlend rLatency=rLatency k_overdrive=k_overdrive \
+        f22_start_val=f22_start_val f22_peak_val=f22_peak_val f22_end_val=f22_end_val \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+
+ends molmem_device_mon
+
+
+// Explicit Diagnostic Subcircuits
+subckt molmem_device_mon_default (Anode Cathode f22 pulseState conductance junctionTemp)
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0 noise_en=molmem_noise_en \
+        d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    Xdev (Anode Cathode f22 pulseState conductance junctionTemp) molmem_device_mon device_type=0 Rc=Rc state_init=state_init n_init=n_init \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+ends molmem_device_mon_default
+
+subckt molmem_device_mon_ru_azo (Anode Cathode f22 pulseState conductance junctionTemp)
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0 noise_en=molmem_noise_en \
+        d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    Xdev (Anode Cathode f22 pulseState conductance junctionTemp) molmem_device_mon device_type=1 Rc=Rc state_init=state_init n_init=n_init \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+ends molmem_device_mon_ru_azo
+
+// Backward-Compatible 4-Terminal Legacy Adapter
+subckt molmem_device_mon_4term (Anode Cathode f22 pulseState)
+    parameters device_type=0 Rc=molmem_Rc state_init=-1.0 n_init=-1.0 mon_en=1
+    Xdev (Anode Cathode f22 pulseState gUnconnected tempUnconnected) molmem_device_mon \
+        device_type=device_type Rc=Rc state_init=state_init n_init=n_init mon_en=mon_en
+ends molmem_device_mon_4term
+
+
+// ----------------------------------------------------------------------------
+// 3. 1T1R (1-Transistor-1-Memristor) Crossbar Cell (WL, BL, SL)
+// ----------------------------------------------------------------------------
+subckt molmem_1t1r (WL BL SL)
+    parameters device_type=0
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters r_on=100.0 r_off=1G v_sel_th=0.8
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+
+    // Memristor Device
+    Xmem (BL mid_node) molmem_device device_type=device_type Rc=Rc state_init=state_init n_init=n_init \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+
+    // Ideal Voltage-Controlled Selector Switch (Access Transistor Equivalent)
+    Wsel (mid_node SL WL 0) vswitch ron=r_on roff=r_off von=v_sel_th voff=(v_sel_th - 0.2)
+ends molmem_1t1r
+
+subckt molmem_1t1r_default (WL BL SL)
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters r_on=100.0 r_off=1G v_sel_th=0.8
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    Xcell (WL BL SL) molmem_1t1r device_type=0 Rc=Rc state_init=state_init n_init=n_init r_on=r_on r_off=r_off v_sel_th=v_sel_th \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+ends molmem_1t1r_default
+
+subckt molmem_1t1r_ru_azo (WL BL SL)
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters r_on=100.0 r_off=1G v_sel_th=0.8
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    Xcell (WL BL SL) molmem_1t1r device_type=1 Rc=Rc state_init=state_init n_init=n_init r_on=r_on r_off=r_off v_sel_th=v_sel_th \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed
+ends molmem_1t1r_ru_azo
+
+
+// ----------------------------------------------------------------------------
+// 4. Universal 2-Terminal Symbol Aliases (plus, minus) and MolecularMemristor
+// ----------------------------------------------------------------------------
+subckt molmem (plus minus)
+    parameters device_type=0
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters kappa=molmem_kappa alpha=molmem_alpha gScale=molmem_gScale \
+        Vth=molmem_Vth Vref_pos=molmem_Vref_pos Vref_neg=molmem_Vref_neg \
+        K_discharge=molmem_K_discharge rate_asymmetry=molmem_rate_asymmetry \
+        V_smooth=molmem_V_smooth n_smooth=molmem_n_smooth n_max=molmem_n_max
+    parameters gamma=molmem_gamma beta_alpha=molmem_beta_alpha beta_s=molmem_beta_s \
+        E_a=molmem_E_a R_th=molmem_R_th tau_th=molmem_tau_th
+    parameters rTopBlend=molmem_rTopBlend fDischarge=molmem_fDischarge cDischarge=molmem_cDischarge \
+        rBottomBlend=molmem_rBottomBlend rLatency=molmem_rLatency k_overdrive=molmem_k_overdrive
+    parameters f22_start_val=molmem_f22_start_val f22_peak_val=molmem_f22_peak_val f22_end_val=molmem_f22_end_val
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    parameters mon_en=0
+
+    Xdev (plus minus) molmem_device device_type=device_type Rc=Rc state_init=state_init n_init=n_init \
+        kappa=kappa alpha=alpha gScale=gScale \
+        Vth=Vth Vref_pos=Vref_pos Vref_neg=Vref_neg rate_asymmetry=rate_asymmetry \
+        n_max=n_max K_discharge=K_discharge \
+        V_smooth=V_smooth n_smooth=n_smooth \
+        gamma=gamma beta_alpha=beta_alpha beta_s=beta_s \
+        E_a=E_a R_th=R_th tau_th=tau_th \
+        rTopBlend=rTopBlend fDischarge=fDischarge cDischarge=cDischarge \
+        rBottomBlend=rBottomBlend rLatency=rLatency k_overdrive=k_overdrive \
+        f22_start_val=f22_start_val f22_peak_val=f22_peak_val f22_end_val=f22_end_val \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed mon_en=mon_en
+ends molmem
+
+subckt molmem_ru_azo (plus minus)
+    parameters device_type=1
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters kappa=molmem_kappa alpha=molmem_alpha gScale=molmem_gScale \
+        Vth=molmem_Vth Vref_pos=molmem_Vref_pos Vref_neg=molmem_Vref_neg \
+        K_discharge=molmem_K_discharge rate_asymmetry=molmem_rate_asymmetry \
+        V_smooth=molmem_V_smooth n_smooth=molmem_n_smooth n_max=molmem_n_max
+    parameters gamma=molmem_gamma beta_alpha=molmem_beta_alpha beta_s=molmem_beta_s \
+        E_a=molmem_E_a R_th=molmem_R_th tau_th=molmem_tau_th
+    parameters rTopBlend=molmem_rTopBlend fDischarge=molmem_fDischarge cDischarge=molmem_cDischarge \
+        rBottomBlend=molmem_rBottomBlend rLatency=molmem_rLatency k_overdrive=molmem_k_overdrive
+    parameters f22_start_val=molmem_f22_start_val f22_peak_val=molmem_f22_peak_val f22_end_val=molmem_f22_end_val
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    parameters mon_en=0
+
+    Xdev (plus minus) molmem_device device_type=1 Rc=Rc state_init=state_init n_init=n_init \
+        kappa=kappa alpha=alpha gScale=gScale \
+        Vth=Vth Vref_pos=Vref_pos Vref_neg=Vref_neg rate_asymmetry=rate_asymmetry \
+        n_max=n_max K_discharge=K_discharge \
+        V_smooth=V_smooth n_smooth=n_smooth \
+        gamma=gamma beta_alpha=beta_alpha beta_s=beta_s \
+        E_a=E_a R_th=R_th tau_th=tau_th \
+        rTopBlend=rTopBlend fDischarge=fDischarge cDischarge=cDischarge \
+        rBottomBlend=rBottomBlend rLatency=rLatency k_overdrive=k_overdrive \
+        f22_start_val=f22_start_val f22_peak_val=f22_peak_val f22_end_val=f22_end_val \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed mon_en=mon_en
+ends molmem_ru_azo
+
+subckt MolecularMemristor (Anode Cathode)
+    parameters device_type=0
+    parameters Rc=molmem_Rc state_init=-1.0 n_init=-1.0
+    parameters kappa=molmem_kappa alpha=molmem_alpha gScale=molmem_gScale \
+        Vth=molmem_Vth Vref_pos=molmem_Vref_pos Vref_neg=molmem_Vref_neg \
+        K_discharge=molmem_K_discharge rate_asymmetry=molmem_rate_asymmetry \
+        V_smooth=molmem_V_smooth n_smooth=molmem_n_smooth n_max=molmem_n_max
+    parameters gamma=molmem_gamma beta_alpha=molmem_beta_alpha beta_s=molmem_beta_s \
+        E_a=molmem_E_a R_th=molmem_R_th tau_th=molmem_tau_th
+    parameters rTopBlend=molmem_rTopBlend fDischarge=molmem_fDischarge cDischarge=molmem_cDischarge \
+        rBottomBlend=molmem_rBottomBlend rLatency=molmem_rLatency k_overdrive=molmem_k_overdrive
+    parameters f22_start_val=molmem_f22_start_val f22_peak_val=molmem_f22_peak_val f22_end_val=molmem_f22_end_val
+    parameters noise_en=molmem_noise_en d2d_variation_intensity=molmem_d2d_intensity d2d_u=molmem_d2d_u \
+        read_noise_intensity=molmem_read_noise_int write_noise_intensity=molmem_write_noise_int \
+        write_noise_seed=molmem_write_noise_seed
+    parameters mon_en=0
+
+    Xdev (Anode Cathode) molmem_device device_type=device_type Rc=Rc state_init=state_init n_init=n_init \
+        kappa=kappa alpha=alpha gScale=gScale \
+        Vth=Vth Vref_pos=Vref_pos Vref_neg=Vref_neg rate_asymmetry=rate_asymmetry \
+        n_max=n_max K_discharge=K_discharge \
+        V_smooth=V_smooth n_smooth=n_smooth \
+        gamma=gamma beta_alpha=beta_alpha beta_s=beta_s \
+        E_a=E_a R_th=R_th tau_th=tau_th \
+        rTopBlend=rTopBlend fDischarge=fDischarge cDischarge=cDischarge \
+        rBottomBlend=rBottomBlend rLatency=rLatency k_overdrive=k_overdrive \
+        f22_start_val=f22_start_val f22_peak_val=f22_peak_val f22_end_val=f22_end_val \
+        noise_en=noise_en d2d_variation_intensity=d2d_variation_intensity d2d_u=d2d_u \
+        read_noise_intensity=read_noise_intensity write_noise_intensity=write_noise_intensity \
+        write_noise_seed=write_noise_seed mon_en=mon_en
+ends MolecularMemristor
+

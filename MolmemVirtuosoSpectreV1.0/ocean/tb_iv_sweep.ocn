@@ -1,0 +1,66 @@
+; ============================================================================
+; Cadence Virtuoso Viva Waveform Display Script: tb_iv_sweep.ocn
+; File: SpectreModelsV2/ocean/tb_iv_sweep.ocn
+; ============================================================================
+
+simulator('spectre)
+
+resultsDir = cond(
+    (isDir("./tb_iv_sweep.raw")               "./tb_iv_sweep.raw")
+    (isDir("./testbenches/tb_iv_sweep.raw")   "./testbenches/tb_iv_sweep.raw")
+    (isDir("../testbenches/tb_iv_sweep.raw")  "../testbenches/tb_iv_sweep.raw")
+    (t                                        "./tb_iv_sweep.raw")
+)
+if(isDir(resultsDir) then
+    openResults(resultsDir)
+
+    availResults = results()
+    cond(
+        (member('tran availResults)              selectResult('tran))
+        (member("tran-tran" availResults)        selectResult("tran-tran"))
+        (member('tranIv availResults)            selectResult('tranIv))
+        (member('tranIv-tran availResults)       selectResult('tranIv-tran))
+        (member("tranIv-tran" availResults)      selectResult("tranIv-tran"))
+        (member('tran-tran availResults)         selectResult('tran-tran))
+        (t
+            ; Fallback: prefer transient dataset over static variables table
+            let((tranDs)
+                tranDs = car(setof(x availResults pcreMatchp("tran" sprintf(nil "%s" x))))
+                if(tranDs then
+                    selectResult(tranDs)
+                else
+                    if(availResults then selectResult(car(last(availResults))))
+                )
+            )
+        )
+    )
+
+    win = newWindow()
+    when(isCallable('addSubwindowTitle)
+        addSubwindowTitle("MolMemristor I-V Sweep & Pinched Hysteresis (Cadence Spectre)")
+    )
+    when(isCallable('awvSetWindowTitle) && boundp('win) && win
+        awvSetWindowTitle(win "MolMemristor I-V Sweep & Pinched Hysteresis (Cadence Spectre)")
+    )
+
+    vSweep       = nil
+    errset(vSweep = v("driveNode") || v("vSweep") || v("V_sweep") || v("/driveNode") nil)
+    f22          = nil
+    errset(f22 = v("f22") || v("condState") || v("f22_mon") || v("/f22") nil)
+    conductance  = nil
+    errset(conductance = v("conductance") || v("g_mon") || v("/conductance") nil)
+    iMem         = nil
+    errset(iMem = i("Xdut:Anode") * 1.0e3 || i("/Xdut/Anode") * 1.0e3 nil)
+    junctionTemp = nil
+    errset(junctionTemp = v("junctionTemp") || v("temp_mon") || v("/junctionTemp") nil)
+
+    when(vSweep       plot(vSweep       ?expr '("Sweep Voltage (V)")))
+    when(iMem         when(isCallable('addStrip) addStrip()) plot(iMem         ?expr '("Current (mA)")))
+    when(f22          when(isCallable('addStrip) addStrip()) plot(f22          ?expr '("Conductance State (f22)")))
+    when(conductance  when(isCallable('addStrip) addStrip()) plot(conductance  ?expr '("Conductance (mS)")))
+    when(junctionTemp when(isCallable('addStrip) addStrip()) plot(junctionTemp ?expr '("Junction Temperature (K)")))
+
+    printf("[Ocean] Waveforms successfully plotted to Viva window.\n")
+else
+    printf("[Ocean] Error: Results directory '%s' not found. Run 'spectre tb_iv_sweep.scs' first.\n" resultsDir)
+)

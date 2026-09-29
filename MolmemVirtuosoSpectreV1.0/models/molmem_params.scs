@@ -1,0 +1,60 @@
+// ============================================================================
+// Molecular Memristor Calibrated Device Parameters & Global Options (Spectre)
+// File: models/molmem_params.scs
+//
+// Calibrated physical hyperparameters synchronized with Python devices.py
+// (_DEFAULT_CONFIG / _RU_AZO_CONFIG).
+//
+// Provides recommended simulator convergence and solver options globally,
+// eliminating duplicate simulatorOptions blocks across individual testbenches:
+//   - bin_relref=yes : Bins multi-decade signals (0.9V drive vs 33kV n_mon)
+//   - useprobes=no   : Reconstructs terminal currents without matrix iprobes
+//   - reltol=1e-3, vabstol=1e-6, iabstol=1e-12, temp=25
+// ============================================================================
+
+simulator lang=spectre
+
+// --- Global Simulator Convergence & Solver Options ---
+simulatorOptions options \
+    reltol=1e-3 \
+    vabstol=1e-6 \
+    iabstol=1e-12 \
+    bin_relref=yes \
+    useprobes=no \
+    ignorevaref=yes
+
+parameters \
+    molmem_Rc               = 0.008033 \
+    molmem_n_init           = 0.0 \
+    molmem_kappa            = 1.172865e7 \
+    molmem_alpha            = 0.931756 \
+    molmem_gScale           = 6.227303 \
+    molmem_Vth              = 0.466409 \
+    molmem_Vref_pos         = 0.900000 \
+    molmem_Vref_neg         = 0.750000 \
+    molmem_K_discharge      = 362.88 \
+    molmem_rate_asymmetry   = 0.985694 \
+    molmem_V_smooth         = 0.103776 \
+    molmem_n_smooth         = 17.06 \
+    molmem_n_max            = 33040.0 \
+    molmem_gamma            = -0.012230 \
+    molmem_beta_alpha       = 0.125186 \
+    molmem_beta_s           = -4.382853 \
+    molmem_E_a              = 0.155923 \
+    molmem_R_th             = 52.14 \
+    molmem_tau_th           = 1.278e-07 \
+    molmem_rTopBlend        = 0.050000 \
+    molmem_fDischarge       = 0.374848 \
+    molmem_cDischarge       = 0.0 \
+    molmem_rBottomBlend     = 0.714488 \
+    molmem_rLatency         = 0.878506 \
+    molmem_k_overdrive      = 7.296635 \
+    molmem_f22_start_val    = 0.12037256 \
+    molmem_f22_peak_val     = 0.87791974 \
+    molmem_f22_end_val      = 0.13955489 \
+    molmem_noise_en         = 0 \
+    molmem_d2d_intensity    = 1.0 \
+    molmem_d2d_u            = 0.5 \
+    molmem_read_noise_int   = 1.0 \
+    molmem_write_noise_int  = 1.0 \
+    molmem_write_noise_seed = 0.0

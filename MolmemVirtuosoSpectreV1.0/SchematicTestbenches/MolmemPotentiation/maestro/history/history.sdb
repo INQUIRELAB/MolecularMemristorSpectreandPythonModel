@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<setupdb version="7">history
+	<active>Active Setup</active>
+	<history>History
+		<historyentry assemblerOrExplorer="explorer" roOrView="view" runningOrFinished="finished">ExplorerRun.0
+			<timestamp>Sep 18 01:29:20 2026</timestamp>
+			<uuid>{774211ce-a586-447e-9370-477bfb9c2978}</uuid>
+			<locked>0</locked>
+			<mode>Single Run, Sweeps and Corners</mode>
+			<resultsname>/home/cadence0/Desktop/MolmemVirtuosoSpectreV1.0/SchematicTestbenches/MolmemPotentiation/maestro/results/maestro/$AXL_HISTORY_NAME.rdb</resultsname>
+			<simresults>$AXL_SETUPDB_DIR/results/maestro/$AXL_HISTORY_NAME.rdb</simresults>
+			<runlog>/home/cadence0/Desktop/MolmemVirtuosoSpectreV1.0/SchematicTestbenches/MolmemPotentiation/maestro/results/maestro/$AXL_HISTORY_NAME.log</runlog>
+			<runlogfile>$AXL_SETUPDB_DIR/results/maestro/$AXL_HISTORY_NAME.log</runlogfile>
+			<psfdir>/home/cadence0/simulation/SchematicTestbenches/MolmemPotentiation/maestro/results/maestro/$AXL_HISTORY_NAME</psfdir>
+			<simdir>$AXL_PROJECT_DIR/SchematicTestbenches/MolmemPotentiation/maestro/results/maestro/$AXL_HISTORY_NAME</simdir>
+		</historyentry>
+	</history>
+</setupdb>

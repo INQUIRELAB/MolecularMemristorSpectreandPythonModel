@@ -1,0 +1,44 @@
+// ============================================================================
+// 8x8 Crossbar Matrix Parallel Inference Testbench
+// File: tb_crossbar_8x8.scs
+//
+// Drives all 8 rows simultaneously with Pulse Width Modulation (PWM) waveforms
+// and senses integrated column currents through 100 Ohm sense resistors.
+// ============================================================================
+
+simulator lang=spectre
+include "crossbar_8x8.scs"
+
+
+
+parameters V_read = 0.1
+parameters T_stop = 200n
+
+// PWM Row Input Drivers (0.1V read pulses with varying pulse widths)
+Vrow0 (Row0 0) vsource type=pulse val0=0 val1=V_read period=200n width=20n rise=1n fall=1n
+Vrow1 (Row1 0) vsource type=pulse val0=0 val1=V_read period=200n width=40n rise=1n fall=1n
+Vrow2 (Row2 0) vsource type=pulse val0=0 val1=V_read period=200n width=60n rise=1n fall=1n
+Vrow3 (Row3 0) vsource type=pulse val0=0 val1=V_read period=200n width=80n rise=1n fall=1n
+Vrow4 (Row4 0) vsource type=pulse val0=0 val1=V_read period=200n width=100n rise=1n fall=1n
+Vrow5 (Row5 0) vsource type=pulse val0=0 val1=V_read period=200n width=120n rise=1n fall=1n
+Vrow6 (Row6 0) vsource type=pulse val0=0 val1=V_read period=200n width=140n rise=1n fall=1n
+Vrow7 (Row7 0) vsource type=pulse val0=0 val1=V_read period=200n width=160n rise=1n fall=1n
+
+// 8x8 Crossbar Array Instance
+Xarray (Row0 Row1 Row2 Row3 Row4 Row5 Row6 Row7 Col0 Col1 Col2 Col3 Col4 Col5 Col6 Col7) crossbar_8x8 n_init_default=16520.0
+
+// Column Sense Resistors to Ground (100 Ohms)
+Rsense0 (Col0 0) resistor r=100
+Rsense1 (Col1 0) resistor r=100
+Rsense2 (Col2 0) resistor r=100
+Rsense3 (Col3 0) resistor r=100
+Rsense4 (Col4 0) resistor r=100
+Rsense5 (Col5 0) resistor r=100
+Rsense6 (Col6 0) resistor r=100
+Rsense7 (Col7 0) resistor r=100
+
+// Transient Simulation
+tran_xbar tran stop=T_stop step=1n maxstep=0.5n errpreset=moderate
+
+// Save Column Outputs
+save Col0 Col1 Col2 Col3 Col4 Col5 Col6 Col7

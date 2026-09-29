@@ -1,0 +1,49 @@
+// ============================================================================
+// Molecular Memristor Multi-Regime Electrical Stress Testbench
+// File: tb_stress.scs
+//
+// Replicates `tb_stress.py`:
+// Evaluates state dynamics and numerical stability under harsh electrical stress:
+//   - 0.0 to 1.3 ms : Standard Potentiation (+0.9V, 80ns width, 160ns period)
+//   - 1.3 to 2.0 ms : Standard Depotentiation (-0.75V, 60ns width, 160ns period)
+//   - 2.0 to 3.0 ms : Unpowered Idle (0.0 V)
+//   - 3.0 to 5.0 ms : Hard Overdrive Potentiation (+1.2V, 80ns width, 160ns period)
+//   - 5.0 to 5.5 ms : Hard High-Field Depotentiation (-1.6V, 120ns width, 240ns period)
+//   - 5.5 to 7.0 ms : Recovery Potentiation (+1.2V, 80ns width, 160ns period)
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+
+
+parameters tStop = 7.0m
+
+// --- Stress Pulse Generators ---
+Vpot      (vpotNode 0)      vsource type=pulse val0=0 val1=0.9  period=160n width=80n  rise=1n fall=1n
+Vdep      (vdepNode 0)      vsource type=pulse val0=0 val1=-0.75 period=160n width=60n  rise=1n fall=1n delay=1.3m
+VpotHard  (vpotHardNode 0)  vsource type=pulse val0=0 val1=1.2  period=160n width=80n  rise=1n fall=1n delay=3.0m
+VdepHard  (vdepHardNode 0)  vsource type=pulse val0=0 val1=-1.6 period=240n width=120n rise=1n fall=1n delay=5.0m
+
+// --- Multi-Regime Stress Voltage Multiplexer ---
+vStress (driveNode 0) bsource v= \
+    (time < 1.3m) ? V(vpotNode) : \
+    ((time < 2.0m) ? V(vdepNode) : \
+    ((time < 3.0m) ? 0.0 : \
+    ((time < 5.0m) ? V(vpotHardNode) : \
+    ((time < 5.5m) ? V(vdepHardNode) : V(vpotHardNode)))))
+
+// --- Monitored Device Instance ---
+Xdut (driveNode 0 f22 pulseState conductance junctionTemp) molmem_device_mon_default n_init=0.0
+
+// --- Transient Analysis ---
+tranStress tran stop=tStop step=100n maxstep=10n errpreset=moderate
+
+// --- Waveform Saves (Exact 1-to-1 Parity with Python Subfigures) ---
+save driveNode
+save vStress
+save f22
+save pulseState
+save conductance
+save junctionTemp
+save Xdut:Anode

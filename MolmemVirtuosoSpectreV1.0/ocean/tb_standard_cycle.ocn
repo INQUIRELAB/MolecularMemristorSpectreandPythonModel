@@ -1,0 +1,70 @@
+; ============================================================================
+; Cadence Virtuoso Viva Waveform Display Script: tb_standard_cycle.ocn
+; File: SpectreModelsV2/ocean/tb_standard_cycle.ocn
+;
+; Automatically configures waveform strips in Cadence Viva matching
+; the Python `tb_standard_cycle.py` multi-panel subfigures:
+;   Strip 1: Applied Voltage (V)
+;   Strip 2: Memristor Current (mA)
+;   Strip 3: Read Conductance (mS)
+;   Strip 4: Conductance State (f22)
+; ============================================================================
+
+simulator('spectre)
+
+resultsDir = cond(
+    (isDir("./tb_standard_cycle.raw")               "./tb_standard_cycle.raw")
+    (isDir("./testbenches/tb_standard_cycle.raw")   "./testbenches/tb_standard_cycle.raw")
+    (isDir("../testbenches/tb_standard_cycle.raw")  "../testbenches/tb_standard_cycle.raw")
+    (t                                              "./tb_standard_cycle.raw")
+)
+if(isDir(resultsDir) then
+    openResults(resultsDir)
+
+    availResults = results()
+    cond(
+        (member('tran availResults)               selectResult('tran))
+        (member("tran-tran" availResults)         selectResult("tran-tran"))
+        (member('tranStd availResults)            selectResult('tranStd))
+        (member('tranStd-tran availResults)       selectResult('tranStd-tran))
+        (member("tranStd-tran" availResults)      selectResult("tranStd-tran"))
+        (member('tran-tran availResults)          selectResult('tran-tran))
+        (t
+            ; Fallback: prefer transient dataset over static variables table
+            let((tranDs)
+                tranDs = car(setof(x availResults pcreMatchp("tran" sprintf(nil "%s" x))))
+                if(tranDs then
+                    selectResult(tranDs)
+                else
+                    if(availResults then selectResult(car(last(availResults))))
+                )
+            )
+        )
+    )
+
+    win = newWindow()
+    when(isCallable('addSubwindowTitle)
+        addSubwindowTitle("MolMemristor Standard Programming Cycle (Cadence Spectre)")
+    )
+    when(isCallable('awvSetWindowTitle) && boundp('win) && win
+        awvSetWindowTitle(win "MolMemristor Standard Programming Cycle (Cadence Spectre)")
+    )
+
+    vDrive      = nil
+    errset(vDrive = v("driveNode") || v("vDrive") || v("V_drive") || v("/driveNode") nil)
+    iMem        = nil
+    errset(iMem = i("Xdut:Anode") * 1.0e3 || i("/Xdut/Anode") * 1.0e3 nil)
+    conductance = nil
+    errset(conductance = v("conductance") || v("g_mon") || v("/conductance") nil)
+    f22         = nil
+    errset(f22 = v("f22") || v("condState") || v("f22_mon") || v("/f22") nil)
+
+    when(vDrive      plot(vDrive      ?expr '("Applied V")))
+    when(iMem        when(isCallable('addStrip) addStrip()) plot(iMem        ?expr '("Current (mA)")))
+    when(conductance when(isCallable('addStrip) addStrip()) plot(conductance ?expr '("Conductance (mS)")))
+    when(f22         when(isCallable('addStrip) addStrip()) plot(f22         ?expr '("State f22")))
+
+    printf("[Ocean] Waveforms successfully plotted to Viva window.\n")
+else
+    printf("[Ocean] Error: Results directory '%s' not found. Run 'spectre tb_standard_cycle.scs' first.\n" resultsDir)
+)

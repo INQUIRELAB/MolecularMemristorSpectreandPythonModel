@@ -1,0 +1,38 @@
+// ============================================================================
+// Molecular Memristor Thermal Relaxation & State Stability Testbench
+// File: tb_thermal_relaxation.scs
+//
+// Replicates `tb_thermal_relaxation.py`:
+// Demonstrates microscopic Joule heating equilibrium, Newton cooling relaxation
+// (tau_th = 127.8 ns), and state retention under sustained sub-threshold read bias:
+//   - Phase 1 (0.0 to 2.5 ms): Sustained DC read bias V_read = 0.1 V
+//   - Phase 2 (2.5 to 5.0 ms): Unpowered relaxation (0.0 V)
+// ============================================================================
+
+simulator lang=spectre
+include "../models/molmem.scs"
+
+
+
+parameters vRead   = 0.1         // Standardized sub-threshold read voltage (V)
+parameters tSwitch = 2.5m        // Turn-off edge at 2.5 ms
+parameters tStop   = 5.0m        // Total testbench stop time
+
+// Sustained DC Step with Turn-off at tSwitch
+vDrive (driveNode 0) bsource v=(time < tSwitch) ? vRead : 0.0
+
+// Device Under Test initialized at mid-conductance state (n_init = 16,520)
+Xdut (driveNode 0 f22 pulseState conductance junctionTemp) molmem_device_mon_default n_init=16520.0
+
+// Transient Analysis with fine steps across switching edge to resolve 127.8ns thermal time constant
+tranThermal tran stop=tStop step=10u maxstep=25n errpreset=conservative
+
+// Waveform Saves (Exact 1-to-1 Parity with Python Subfigures)
+save driveNode
+save vDrive
+save f22
+save pulseState
+save conductance
+save junctionTemp
+save Xdut:Anode
+
