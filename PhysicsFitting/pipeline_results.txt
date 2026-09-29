@@ -1,0 +1,20 @@
+================================================================
+          UNIFIED PHYSICS MODELING PIPELINE EXECUTION           
+================================================================
+\n\n================================================================
+  STAGE 1: phi_from_probability.py
+================================================================\n
+\n[Warning] STAGE 1: phi_from_probability.py skipped. 'Probability Matrix.xlsx' not found.\nThis is expected if you are relying on the pre-generated 'Phi_from_probability.csv'.
+\n[Pipeline] STAGE 1: phi_from_probability.py completed in 0.48 seconds.
+\n\n================================================================
+  STAGE 2: RegularizedFitting.py
+================================================================\n
+Using 32 parallel processes for cost function.
+Generating ideal smoothed baseline curves...
+
+Generating smooth (logistic fit + snapping) phim behavioral baseline plot...
+Warning: Double logistic fit failed for n=0.0. Using original curve.
+Warning: Double logistic fit failed for n=2000.0. Using original curve.
+Warning: Double logistic fit failed for n=4000.0. Using original curve.
+Warning: Double logistic fit failed for n=6000.0. Using original curve.
+Warning: Double logistic fit failed for n=8000.0. Using original curve.

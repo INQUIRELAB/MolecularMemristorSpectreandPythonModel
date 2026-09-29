@@ -1,0 +1,23 @@
+{
+  "dataset_metadata": {
+    "source_read_file": "Read_Noise_3000_Devices\\devices_3000_5x5.mat",
+    "source_write_file": "Write_Noise_Gd1.mat",
+    "v_read_volts": 0.2,
+    "n_tested_devices": 3000,
+    "n_write_cycles": 2000,
+    "pulses_per_write_cycle": 16520
+  },
+  "empirical_parameters": {
+    "read_noise_floor_Siemens": 2.7231624008606518e-08,
+    "read_noise_max_Siemens": 8.053642871217658e-08,
+    "d2d_mean_std_Siemens": 1.071694740502148e-07,
+    "write_pulse_mean_step_Siemens": 3.587291544237979e-07,
+    "write_pulse_mean_std_Siemens": 3.192390140566283e-08,
+    "global_relative_write_noise": 0.08899165571568894
+  },
+  "generated_pwl_files": {
+    "read_noise": "generated_pwl\\read_noise.pwl",
+    "write_noise": "generated_pwl\\write_noise.pwl",
+    "d2d_mismatch_quantile": "generated_pwl\\d2d_mismatch_quantile.pwl"
+  }
+}

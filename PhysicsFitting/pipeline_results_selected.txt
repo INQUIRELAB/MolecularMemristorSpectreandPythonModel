@@ -1,0 +1,165 @@
+
+================================================================
+          SELECTED PHYSICS MODELING PIPELINE EXECUTION          
+================================================================
+Logging output to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\pipeline_results_selected.txt
+
+
+================================================================
+  STAGE 4: ConductanceFitting.py
+================================================================
+
+Parameter interpolators built successfully.
+Physical constants initialized.
+ConductanceModel initialized and ready.
+
+--- Stage 0: Tuning A_ET to Match Reference p1/p2 ---
+  Trying A_ET =  100.00 -> p1= 657.97, p2=1669.90, Error=3.0644
+  Trying A_ET =  105.00 -> p1= 657.81, p2=1578.83, Error=2.9230
+  Trying A_ET =  110.00 -> p1= 658.53, p2=1496.94, Error=2.7985
+  Trying A_ET =  115.00 -> p1= 658.26, p2=1428.65, Error=2.6970
+  Trying A_ET =  125.00 -> p1= 659.59, p2=1271.82, Error=2.4705
+  Trying A_ET =  135.00 -> p1= 659.56, p2=1154.31, Error=2.3075
+  Trying A_ET =  155.00 -> p1= 661.16, p2= 915.91, Error=1.9937
+  Trying A_ET =  175.00 -> p1= 662.19, p2= 720.57, Error=1.7537
+  Trying A_ET =  215.00 -> p1= 664.58, p2= 405.06, Error=1.3984
+  Trying A_ET =  255.00 -> p1= 667.63, p2= 123.19, Error=1.1149
+  Trying A_ET =  335.00 -> p1= 672.97, p2=-307.47, Error=0.7437
+  Trying A_ET =  415.00 -> p1= 675.80, p2=-617.61, Error=0.5228
+  Trying A_ET =  575.00 -> p1= 683.93, p2=-1119.37, Error=0.2475
+  Trying A_ET =  735.00 -> p1= 690.22, p2=-1493.21, Error=0.1086
+  Trying A_ET = 1055.00 -> p1= 703.69, p2=-2108.31, Error=0.0031
+  Trying A_ET = 1375.00 -> p1= 713.27, p2=-2547.63, Error=0.0217
+  Trying A_ET = 1375.00 -> p1= 713.27, p2=-2547.63, Error=0.0217
+  Trying A_ET = 1215.00 -> p1= 708.79, p2=-2331.63, Error=0.0028
+  Trying A_ET = 1375.00 -> p1= 713.27, p2=-2547.63, Error=0.0217
+  Trying A_ET = 1135.00 -> p1= 705.41, p2=-2213.77, Error=0.0004
+  Trying A_ET = 1055.00 -> p1= 703.69, p2=-2108.31, Error=0.0031
+  Trying A_ET = 1175.00 -> p1= 707.78, p2=-2289.63, Error=0.0013
+  Trying A_ET = 1095.00 -> p1= 704.72, p2=-2163.49, Error=0.0011
+  Trying A_ET = 1115.00 -> p1= 705.53, p2=-2202.37, Error=0.0005
+  Trying A_ET = 1155.00 -> p1= 707.23, p2=-2264.60, Error=0.0008
+  Trying A_ET = 1125.00 -> p1= 705.29, p2=-2208.62, Error=0.0004
+  Trying A_ET = 1145.00 -> p1= 705.91, p2=-2237.90, Error=0.0004
+  Trying A_ET = 1140.00 -> p1= 705.36, p2=-2216.24, Error=0.0004
+  Trying A_ET = 1145.00 -> p1= 705.91, p2=-2237.90, Error=0.0004
+  Trying A_ET = 1137.50 -> p1= 705.41, p2=-2213.77, Error=0.0004
+  Trying A_ET = 1137.50 -> p1= 705.41, p2=-2213.77, Error=0.0004
+  Trying A_ET = 1142.50 -> p1= 706.51, p2=-2243.76, Error=0.0005
+  Trying A_ET = 1138.75 -> p1= 705.36, p2=-2216.24, Error=0.0004
+  Trying A_ET = 1141.25 -> p1= 705.75, p2=-2228.84, Error=0.0004
+  Trying A_ET = 1142.50 -> p1= 706.51, p2=-2243.76, Error=0.0005
+  Trying A_ET = 1142.50 -> p1= 706.51, p2=-2243.76, Error=0.0005
+  Trying A_ET = 1140.62 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.00 -> p1= 705.36, p2=-2216.24, Error=0.0004
+  Trying A_ET = 1140.94 -> p1= 705.75, p2=-2228.84, Error=0.0004
+  Trying A_ET = 1140.94 -> p1= 705.75, p2=-2228.84, Error=0.0004
+  Trying A_ET = 1140.31 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.47 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.78 -> p1= 705.75, p2=-2228.84, Error=0.0004
+  Trying A_ET = 1140.55 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.55 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.70 -> p1= 705.75, p2=-2228.84, Error=0.0004
+  Trying A_ET = 1140.59 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.59 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.66 -> p1= 705.75, p2=-2228.84, Error=0.0004
+  Trying A_ET = 1140.61 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.61 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.64 -> p1= 705.75, p2=-2228.84, Error=0.0004
+  Trying A_ET = 1140.62 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Trying A_ET = 1140.62 -> p1= 705.74, p2=-2225.35, Error=0.0004
+  Optimization complete. Optimal A_ET = 1140.6250
+
+--- Re-characterizing model with optimal A_ET ---
+
+--- Stage 1.1: Characterizing k_ET (Physical Model) ---
+Calculated 100 k_ET values.
+
+--- Stage 1.1: Fitting k_ET (Analytical Model) ---
+Fitted k_ET analytical model parameters (Exponential):
+  A = 1.9358e+01
+  B = 35.9721
+
+--- Stage 1.2: Calculating f22 (Full SET/RESET Cycle from phimol) ---
+  Generating Z22 vs. n data for linear fit...
+  Dynamically fit n(Z22): p1 = 705.7374, p2 = -2225.3507
+  Calculating f22 for 500 pulse counts...
+  f22 calculation complete.
+
+--- Stage 2.1: Characterizing Current (Physical Model) ---
+  Pre-calculating f22 for 5 pulse counts...
+
+--- Stage 1.2: Calculating f22 (Full SET/RESET Cycle from phimol) ---
+  Generating Z22 vs. n data for linear fit...
+  Dynamically fit n(Z22): p1 = 705.7374, p2 = -2225.3507
+  Calculating f22 for 5 pulse counts...
+  f22 calculation complete.
+  Calculating current for 5 x 101 grid points...
+Current characterization complete.
+
+--- Stage 2.1: Fitting Current (Analytical Model) ---
+
+--- Stage 1.2: Calculating f22 (Full SET/RESET Cycle from phimol) ---
+  Generating Z22 vs. n data for linear fit...
+  Dynamically fit n(Z22): p1 = 705.7374, p2 = -2225.3507
+  Calculating f22 for 5 pulse counts...
+  f22 calculation complete.
+  Fitted Current Model: I = 2.5005e-04 * f22 * sinh(V / 0.3438)
+
+--- Characterizing Current vs. Pulse Count at a fixed Vr ---
+
+--- Stage 2.1: Characterizing Current (Physical Model) ---
+  Pre-calculating f22 for 400 pulse counts...
+
+--- Stage 1.2: Calculating f22 (Full SET/RESET Cycle from phimol) ---
+  Generating Z22 vs. n data for linear fit...
+  Dynamically fit n(Z22): p1 = 705.7374, p2 = -2225.3507
+  Calculating f22 for 400 pulse counts...
+  f22 calculation complete.
+  Calculating current for 400 x 1 grid points...
+Current characterization complete.
+
+Generating initial Φ_mol curves for n = [ 1000  2000  3000  4000  5000  6000  7000  8000  9000 10000 11000 12000
+ 13000 14000 15000 16000 17000 18000 19000 20000]...
+
+[Pipeline] Saved figure to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\Figures\01_k_ET_vs__Φ_mol__Physical_Model_vs__Analytical_Fit.png
+[Pipeline] Saved raw plot data to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\PlotData\01_k_ET_vs__Φ_mol__Physical_Model_vs__Analytical_Fit.json
+
+[Pipeline] Saved figure to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\Figures\02_f₂₂_n___Fraction_of_Switched_Molecules_vs__Pulse_Count.png
+[Pipeline] Saved raw plot data to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\PlotData\02_f₂₂_n___Fraction_of_Switched_Molecules_vs__Pulse_Count.json
+
+[Pipeline] Saved figure to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\Figures\03_n_vs__Z₂₂__Dynamic_Linear_Fit.png
+[Pipeline] Saved raw plot data to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\PlotData\03_n_vs__Z₂₂__Dynamic_Linear_Fit.json
+
+[Pipeline] Saved figure to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\Figures\04_I_V_Curves_from_Physical_Model_for_Different_Pulse_Counts.png
+[Pipeline] Saved raw plot data to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\PlotData\04_I_V_Curves_from_Physical_Model_for_Different_Pulse_Counts.json
+
+[Pipeline] Saved figure to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\Figures\05_Current_vs__Pulse_Count_at_Vr___0_5V.png
+[Pipeline] Saved raw plot data to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\PlotData\05_Current_vs__Pulse_Count_at_Vr___0_5V.json
+
+[Pipeline] Saved figure to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\Figures\06_Φ_mol_z_n__Curves___Input_to_Conductance_Model.png
+[Pipeline] Saved raw plot data to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\PlotData\06_Φ_mol_z_n__Curves___Input_to_Conductance_Model.json
+
+--- Exporting Fitted Parameters ---
+Fitted parameters saved to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\fitted_model_parameters.csv
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\SpectreModels\data\f22_pot_map.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\PythonSimulator\molmem_lib\data\f22_pot_map.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\SpectreModels\data\f22_dep_map.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\PythonSimulator\molmem_lib\data\f22_dep_map.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\SpectreModels\data\I_scale.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\PythonSimulator\molmem_lib\data\I_scale.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\SpectreModels\data\V_scale.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\PythonSimulator\molmem_lib\data\V_scale.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\SpectreModels\data\f22_start.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\SpectreModels\data\f22_peak.pwl
+Saved C:\Users\logan\Desktop\MolMemSimulatorGPU\SpectreModels\data\f22_end.pwl
+
+[Pipeline] STAGE 4: ConductanceFitting.py completed in 3.88 seconds.
+
+
+================================================================
+  PIPELINE FINISHED IN 3.88 SECONDS
+  All logs written to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\pipeline_results_selected.txt
+  All figures saved to C:\Users\logan\Desktop\MolMemSimulatorGPU\PhysicsFitting\Figures
+================================================================
+
