@@ -23,19 +23,39 @@
 
 ---
 
-## Why MolMem?
+## The Simulation Landscape & Why MolMem?
 
-Traditional memristor modeling forces a difficult tradeoff: slow, fragile device-level PDE solvers that stall on multi-device crossbars, or abstract behavioral curve-fits that fail to capture physical non-idealities.
+Researchers and hardware designers working on analog in-memory computing typically face a difficult dilemma when choosing simulation tools:
 
-**MolMem resolves this bottleneck** by formulating continuous, infinitely differentiable rate equations anchored in thermodynamic transport theory:
+1. **Microscopic Device Solvers (TCAD, Kinetic Monte Carlo, Thermodynamic Molecular Networks)**:  
+   These tools capture realistic atomic and molecular drift, quantum barriers, and electrostatics with high physical fidelity. However, their computational overhead is severe: simulating a small crossbar or a few dozen pulses takes hours or days. They are computationally prohibitive for multi-node array scaling, video-rate matrix operations, or multi-epoch deep learning training.
+
+2. **Large-Scale Architectural & ML Mappers (NeuroSim, MemTorch, PyTorch Behavioral Wrappers)**:  
+   These frameworks excel at evaluating high-level algorithmic accuracy or estimating chip-level silicon area and energy consumption. However, they abstract away the underlying transport physics, relying on static lookup tables or empirical curve fits. They cannot capture dynamic Joule heating, thermal relaxation, non-equilibrium overdrive snapback, or non-linear interconnect line-drop parasitics, and they lack transistor-level circuit models for physical IC design.
+
+### Comparison of Neuromorphic Simulation Platforms
+
+| Platform / Approach | Primary Focus | Transient Physics & Kinetics | Large Crossbar Scaling | Hardware-in-the-Loop AI | Transistor-Level Verification |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Microscopic Solvers**<br>*(TCAD, KMC, Thermodynamic Networks)* | Nanoscale device transport | **Yes** (Detailed physical transport) | Prohibitive (stalls on arrays) | Infeasible (computationally intractable) | Limited / solver stalls |
+| **Circuit Macro-Models**<br>*(e.g., NeuroSim)* | Chip area, latency & energy benchmarking | Abstracted (static lookups) | **Yes** (Architectural estimations) | Trace-based only | Macro estimations only |
+| **ML Behavioral Mappers**<br>*(e.g., MemTorch)* | High-level DNN weight mapping | Abstracted / heuristic curve fits | **Yes** (Fast GPU tensors) | **Yes** (PyTorch native) | No circuit solver backend |
+| **MolMem (This Work)** | **Unified Device-to-Algorithm Bridge** | **Yes** (Thermodynamic Marcus Kinetics) | **Yes** (Vectorized $O(1)$ Engine) | **Yes** (TensorFlow STE & PyTorch) | **Yes** (Spectre-Verified Compact Model) |
+
+---
+
+### Hardware Comparison: Molecular Memristors vs. Conventional NVM
+
+Beyond simulation capabilities, MolMem models the unique physical advantages of transition-metal molecular electronics over conventional filamentary and phase-change technologies:
 
 | Feature | Stochastic Filamentary RRAM | Phase Change Memory (PCM) | **Molecular Memristor (MolMem)** |
 | :--- | :---: | :---: | :---: |
 | **Switching Mechanism** | Stochastic ion migration | Melt-quench / crystallization | **Thermodynamic electron transfer** |
 | **Analog Resolution** | $< 64$ levels ($< 6$-bit) | $< 100$ levels | **16,520 levels (14-bit)** |
 | **I-V Linearity** | Highly non-linear | Non-linear | **Linear symmetric** |
+| **Update Symmetry** | Asymmetric | Asymmetric (abrupt RESET) | **Symmetric ($r_{\text{asym}} = 0.986$)** |
+| **Thermal Stability** | Filament degradation | Structural relaxation / drift | **Newton cooling ($\tau_{\text{th}} = 127.8$ ns)** |
 | **Simulation Speed** | Slow iterative solvers | Lookup tables / empirical | **Vectorized $O(1)$ interpolation engine** |
-| **Convergence** | Frequent Jacobian stalls | Empirical curve fits | **$C^1$-smooth, zero solver divergence** |
 
 ---
 
