@@ -203,6 +203,19 @@ model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=
 
 ---
 
+## Code & Data Availability
+
+All simulation packages, device fitting routines, transistor-level compact models, and experimental validation datasets are openly available on GitHub:  
+[https://github.com/INQUIRELAB/MolecularMemristorSpectreandPythonModel](https://github.com/INQUIRELAB/MolecularMemristorSpectreandPythonModel)
+
+The repository provides full open-source access to:
+* **Physics Modeling Pipeline (`PhysicsFitting/`)**: Microscopic Marcus-Hush-Chidsey electron transfer integrals, Thomas-Fermi screening profiles, and parameter extraction.
+* **Macroscopic Device Calibration (`DeviceFitting/`)**: Arrhenius activation fitting, threshold voltage extraction, and overdrive recovery modeling.
+* **Accelerated Crossbar Simulator (`PythonSimulator/`)**: The complete `molmem_lib` simulation platform, Numba/PyTorch acceleration backends, and TensorFlow deep learning layers.
+* **Transistor-Level Compact Model (`MolmemVirtuosoSpectreV1.0/`)**: Native Cadence Virtuoso cell views and Spectre circuit netlists (`molmem.scs`).
+
+---
+
 ## Citation
 
 If you use MolMem in your research, please cite our manuscript:
